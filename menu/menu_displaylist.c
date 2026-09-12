@@ -7966,6 +7966,30 @@ unsigned menu_displaylist_build_list(
             snprintf(row, sizeof(row), "RomM API Token: %s", *value ? value : "Not configured");
             if (menu_entries_append(list, row, "rommarch_api_token_edit",
                   MENU_ENUM_LABEL_ROMMARCH_API_TOKEN_EDIT, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+
+            {
+               bool proxy_enabled = romm_config_get_http_proxy_enabled();
+
+               snprintf(row, sizeof(row), "HTTP Proxy: %s",
+                     proxy_enabled ? "ON" : "OFF");
+               if (menu_entries_append(list, row, "rommarch_http_proxy_toggle",
+                     MENU_ENUM_LABEL_ROMMARCH_SERVER_EDIT, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+
+               if (proxy_enabled)
+               {
+                  romm_config_get_http_proxy_host(value, sizeof(value));
+                  snprintf(row, sizeof(row), "HTTP Proxy Address: %s",
+                        *value ? value : "Not configured");
+                  if (menu_entries_append(list, row, "rommarch_http_proxy_host_edit",
+                        MENU_ENUM_LABEL_ROMMARCH_SERVER_EDIT, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+
+                  snprintf(row, sizeof(row), "HTTP Proxy Port: %u",
+                        romm_config_get_http_proxy_port());
+                  if (menu_entries_append(list, row, "rommarch_http_proxy_port_edit",
+                        MENU_ENUM_LABEL_ROMMARCH_SERVER_EDIT, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+               }
+            }
+
             if (menu_entries_append(list, "Test Connection", "rommarch_test_connection",
                   MENU_ENUM_LABEL_ROMMARCH_TEST_CONNECTION, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
          }

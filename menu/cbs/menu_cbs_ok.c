@@ -3567,10 +3567,66 @@ static void menu_input_rommarch_server_cb(void *userdata, const char *str)
    menu_input_dialog_end();
 }
 
+static void menu_input_rommarch_http_proxy_host_cb(void *userdata, const char *str)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   (void)userdata;
+
+   if (str)
+   {
+      romm_config_set_http_proxy_host(str);
+      menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   }
+   menu_input_dialog_end();
+}
+
+static void menu_input_rommarch_http_proxy_port_cb(void *userdata, const char *str)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   char *end = NULL;
+   unsigned long port = str ? strtoul(str, &end, 10) : 0;
+   (void)userdata;
+
+   if (str && *str && end && !*end && port > 0 && port <= 65535)
+   {
+      romm_config_set_http_proxy_port((unsigned)port);
+      menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   }
+   menu_input_dialog_end();
+}
+
 static int action_ok_rommarch_server_edit(const char *path,
       const char *label_setting, unsigned type, size_t idx, size_t entry_idx)
 {
    menu_input_ctx_line_t line;
+
+   if (label_setting && string_is_equal(label_setting, "rommarch_http_proxy_toggle"))
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      romm_config_set_http_proxy_enabled(!romm_config_get_http_proxy_enabled());
+      menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+      return 0;
+   }
+
+   if (label_setting && string_is_equal(label_setting, "rommarch_http_proxy_host_edit"))
+   {
+      line.label         = "HTTP Proxy Address";
+      line.label_setting = label_setting;
+      line.type          = type;
+      line.idx           = (unsigned)idx;
+      line.cb            = menu_input_rommarch_http_proxy_host_cb;
+      return menu_input_dialog_start(&line) ? 0 : -1;
+   }
+
+   if (label_setting && string_is_equal(label_setting, "rommarch_http_proxy_port_edit"))
+   {
+      line.label         = "HTTP Proxy Port";
+      line.label_setting = label_setting;
+      line.type          = type;
+      line.idx           = (unsigned)idx;
+      line.cb            = menu_input_rommarch_http_proxy_port_cb;
+      return menu_input_dialog_start(&line) ? 0 : -1;
+   }
 
    line.label         = "RomM Server";
    line.label_setting = label_setting;

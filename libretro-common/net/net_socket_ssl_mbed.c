@@ -205,7 +205,6 @@ error:
 int ssl_socket_connect(void *state_data,
       void *data, bool timeout_enable, bool nonblock)
 {
-   int ret, flags;
    struct ssl_state *state = (struct ssl_state*)state_data;
 
    if (timeout_enable)
@@ -221,6 +220,14 @@ int ssl_socket_connect(void *state_data,
       if (socket_connect(state->net_ctx.fd, data))
          return -1;
    }
+
+   return ssl_socket_handshake(state_data, nonblock);
+}
+
+int ssl_socket_handshake(void *state_data, bool nonblock)
+{
+   int ret, flags;
+   struct ssl_state *state = (struct ssl_state*)state_data;
 
    if (mbedtls_ssl_config_defaults(&state->conf,
                MBEDTLS_SSL_IS_CLIENT,

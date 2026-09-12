@@ -50,6 +50,7 @@ void net_http_connection_free(struct http_connection_t *conn);
 void net_http_connection_set_user_agent(struct http_connection_t *conn, const char *user_agent);
 
 void net_http_connection_set_headers(struct http_connection_t *conn, const char *headers);
+void net_http_connection_set_proxy(struct http_connection_t *conn, const char *host, int port);
 
 /**
  * net_http_sink_t:

@@ -33,6 +33,11 @@ void* ssl_socket_init(int fd, const char *domain);
 
 int ssl_socket_connect(void *state_data, void *data, bool timeout_enable, bool nonblock);
 
+/* Perform only the TLS handshake on an already-connected socket.
+ * This is used by transports that must establish an intermediate tunnel
+ * (for example HTTP CONNECT) before TLS begins. */
+int ssl_socket_handshake(void *state_data, bool nonblock);
+
 int ssl_socket_send_all_blocking(void *state_data, const void *data_, size_t len, bool no_signal);
 
 ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_, size_t len, bool no_signal);

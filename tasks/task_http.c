@@ -27,6 +27,10 @@
 #include "task_file_transfer.h"
 #include "tasks_internal.h"
 
+#ifdef _3DS
+#include "../romm/romm_config.h"
+#endif
+
 enum http_status_enum
 {
    HTTP_STATUS_CONNECTION_TRANSFER = 0,
@@ -375,6 +379,18 @@ static void *task_push_http_transfer_generic_titled(
 
    if (!conn)
       return NULL;
+
+#ifdef _3DS
+   if (romm_config_get_http_proxy_enabled())
+   {
+      char proxy_host[256];
+      unsigned proxy_port = romm_config_get_http_proxy_port();
+
+      if (romm_config_get_http_proxy_host(proxy_host, sizeof(proxy_host)) &&
+          *proxy_host && proxy_port > 0 && proxy_port <= 65535)
+         net_http_connection_set_proxy(conn, proxy_host, (int)proxy_port);
+   }
+#endif
 
    method = net_http_connection_method(conn);
 

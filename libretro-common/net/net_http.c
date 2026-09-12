@@ -175,6 +175,8 @@ struct http_t
    struct conn_pool_entry *conn;
    bool ssl;
    bool request_sent;
+   char *proxy_host;
+   int proxy_port;
 
    request_t request;
    response_t response;
@@ -191,10 +193,12 @@ struct http_connection_t
    void *postdata;
    char *useragent;
    char *headers;
+   char *proxy_host;
    size_t contentlength; /* ptr alignment */
    net_http_sink_t sink;
    void *sink_data;
    int port;
+   int proxy_port;
    bool ssl;
 };
 
@@ -563,6 +567,9 @@ void net_http_connection_free(struct http_connection_t *conn)
    if (conn->headers)
       free(conn->headers);
 
+   if (conn->proxy_host)
+      free(conn->proxy_host);
+
    free(conn);
 }
 
@@ -582,6 +589,19 @@ void net_http_connection_set_headers(
       free(conn->headers);
 
    conn->headers = headers ? strdup(headers) : NULL;
+}
+
+void net_http_connection_set_proxy(
+      struct http_connection_t *conn, const char *host, int port)
+{
+   if (!conn)
+      return;
+
+   if (conn->proxy_host)
+      free(conn->proxy_host);
+
+   conn->proxy_host = (host && *host) ? strdup(host) : NULL;
+   conn->proxy_port = (conn->proxy_host && port > 0) ? port : 0;
 }
 
 /**
@@ -940,8 +960,10 @@ struct http_t *net_http_new(struct http_connection_t *conn)
    if (!state)
       return NULL;
 
-   state->ssl  = conn->ssl;
-   state->conn = NULL;
+   state->ssl        = conn->ssl;
+   state->conn       = NULL;
+   state->proxy_host = conn->proxy_host ? strdup(conn->proxy_host) : NULL;
+   state->proxy_port = conn->proxy_port;
 
    state->request.domain        = strdup(conn->domain);
    state->request.path          = strdup(conn->path);
@@ -1000,7 +1022,8 @@ struct http_t *net_http_new(struct http_connection_t *conn)
        || !state->request.method
        || (conn->contenttype && !state->request.contenttype)
        || (conn->useragent && !state->request.useragent)
-       || (conn->headers   && !state->request.headers))
+       || (conn->headers   && !state->request.headers)
+       || (conn->proxy_host && !state->proxy_host))
    {
       /* Note: no postdata OOM check here.  Ownership of postdata is
        * moved from conn (above), not copied, so the transfer cannot
@@ -1065,6 +1088,60 @@ static void net_http_resolve(void *data)
    UNLOCK_DNS_CACHE();
 }
 
+static const char *net_http_connect_domain(const struct http_t *state)
+{
+   return (state && state->proxy_host && *state->proxy_host)
+      ? state->proxy_host : state->request.domain;
+}
+
+static int net_http_connect_port(const struct http_t *state)
+{
+   return (state && state->proxy_host && *state->proxy_host && state->proxy_port > 0)
+      ? state->proxy_port : state->request.port;
+}
+
+static bool net_http_proxy_connect_tunnel(struct http_t *state, int fd)
+{
+   char request[1024];
+   char response[2048];
+   size_t used = 0;
+   bool err = false;
+   int len;
+
+   if (!state || !state->proxy_host || !*state->proxy_host)
+      return true;
+
+   len = snprintf(request, sizeof(request),
+         "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+         state->request.domain, state->request.port,
+         state->request.domain, state->request.port);
+   if (len <= 0 || (size_t)len >= sizeof(request))
+      return false;
+
+   if (!socket_send_all_blocking_with_timeout(fd, request, (size_t)len, 5000, true))
+      return false;
+
+   while (used + 1 < sizeof(response))
+   {
+      ssize_t got = socket_receive_all_nonblocking(fd, &err,
+            response + used, sizeof(response) - used - 1);
+      if (got < 0 || err)
+         return false;
+      if (got == 0)
+         continue;
+      used += (size_t)got;
+      response[used] = '\0';
+      if (strstr(response, "\r\n\r\n"))
+         break;
+   }
+
+   if (!strstr(response, "\r\n\r\n"))
+      return false;
+
+   return (strncmp(response, "HTTP/1.0 2", 10) == 0 ||
+           strncmp(response, "HTTP/1.1 2", 10) == 0);
+}
+
 static bool net_http_new_socket(struct http_t *state)
 {
    struct addrinfo *addr = NULL;
@@ -1080,7 +1157,7 @@ static bool net_http_new_socket(struct http_t *state)
       conn_pool_lock = slock_new();
 #endif
 
-   entry = net_http_dns_cache_find(state->request.domain, state->request.port);
+   entry = net_http_dns_cache_find(net_http_connect_domain(state), net_http_connect_port(state));
    if (entry)
    {
       if (entry->valid)
@@ -1111,7 +1188,7 @@ static bool net_http_new_socket(struct http_t *state)
    }
    else
    {
-      entry = net_http_dns_cache_add(state->request.domain, state->request.port, NULL);
+      entry = net_http_dns_cache_add(net_http_connect_domain(state), net_http_connect_port(state), NULL);
 #ifdef HAVE_THREADS
       /* create the entry for it as an indicator that the request is underway */
       entry->thread = sthread_create(net_http_resolve, entry);
@@ -1141,8 +1218,8 @@ static bool net_http_connect(struct http_t *state)
     * merely a benign race.  ThreadSanitizer flags it as soon as two
     * transfers overlap. */
    LOCK_DNS_CACHE();
-   dns_entry = net_http_dns_cache_find(state->request.domain,
-         state->request.port);
+   dns_entry = net_http_dns_cache_find(net_http_connect_domain(state),
+         net_http_connect_port(state));
    /* Normally populated by net_http_new_socket() just above, but the
     * entry can expire between the two calls, so this is not the
     * "big bug" the old comment claimed -- it is reachable, and
@@ -1188,7 +1265,25 @@ static bool net_http_connect(struct http_t *state)
             timeout = false;
 #endif
 
-         if (ssl_socket_connect(conn->ssl_ctx, next_addr, timeout, true) < 0)
+         if (state->proxy_host && *state->proxy_host)
+         {
+            if (!socket_connect_with_timeout(conn->fd, next_addr, 5000) ||
+                !socket_set_block(conn->fd, true) ||
+                !net_http_proxy_connect_tunnel(state, conn->fd) ||
+                ssl_socket_handshake(conn->ssl_ctx, true) < 0)
+            {
+               net_http_log_transport_state(state, "proxy_ssl_connect_failed", -1);
+               ssl_socket_close(conn->ssl_ctx);
+               ssl_socket_free(conn->ssl_ctx);
+               conn->ssl_ctx = NULL;
+            }
+            else
+            {
+               conn->connected = true;
+               return true;
+            }
+         }
+         else if (ssl_socket_connect(conn->ssl_ctx, next_addr, timeout, true) < 0)
          {
             net_http_log_transport_state(state, "ssl_connect_failed", -1);
             ssl_socket_close(conn->ssl_ctx);
@@ -1214,6 +1309,12 @@ static bool net_http_connect(struct http_t *state)
       {
          if (socket_connect_with_timeout(conn->fd, next_addr, 5000))
          {
+            if (state->proxy_host && *state->proxy_host)
+            {
+               if (!socket_set_block(conn->fd, true) ||
+                   !net_http_proxy_connect_tunnel(state, conn->fd))
+                  continue;
+            }
             conn->connected = true;
             return true;
          }
@@ -2460,6 +2561,8 @@ void net_http_delete(struct http_t *state)
       free(state->response.data);
    if (state->response.owns_headers && state->response.headers)
       string_list_free(state->response.headers);
+   if (state->proxy_host)
+      free(state->proxy_host);
    if (state->request.domain)
       free(state->request.domain);
    if (state->request.path)

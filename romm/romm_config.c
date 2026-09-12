@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <string/stdstring.h>
@@ -188,6 +189,57 @@ bool romm_config_get_roms_path(char *out, size_t out_size)
 { return romm_config_get_value("roms_path", out, out_size); }
 bool romm_config_set_roms_path(const char *value)
 { return romm_config_set_value("roms_path", value); }
+
+bool romm_config_get_http_proxy_enabled(void)
+{
+   char value[32];
+   if (!romm_config_get_value("http_proxy_enabled", value, sizeof(value)))
+      return false;
+   return string_is_equal(value, "1") ||
+          string_is_equal_noncase(value, "true") ||
+          string_is_equal_noncase(value, "yes") ||
+          string_is_equal_noncase(value, "on");
+}
+
+bool romm_config_set_http_proxy_enabled(bool enabled)
+{ return romm_config_set_value("http_proxy_enabled", enabled ? "1" : "0"); }
+
+bool romm_config_get_http_proxy_host(char *out, size_t out_size)
+{
+   if (!out || out_size == 0)
+      return false;
+   if (romm_config_get_value("http_proxy_host", out, out_size) && *out)
+      return true;
+   strlcpy(out, "192.168.49.1", out_size);
+   return true;
+}
+
+bool romm_config_set_http_proxy_host(const char *value)
+{ return romm_config_set_value("http_proxy_host", value ? value : ""); }
+
+unsigned romm_config_get_http_proxy_port(void)
+{
+   char value[32];
+   unsigned long port;
+   char *end = NULL;
+
+   if (!romm_config_get_value("http_proxy_port", value, sizeof(value)))
+      return 8080;
+
+   port = strtoul(value, &end, 10);
+   if (!*value || (end && *end) || port == 0 || port > 65535)
+      return 8080;
+   return (unsigned)port;
+}
+
+bool romm_config_set_http_proxy_port(unsigned port)
+{
+   char value[16];
+   if (port == 0 || port > 65535)
+      return false;
+   snprintf(value, sizeof(value), "%u", port);
+   return romm_config_set_value("http_proxy_port", value);
+}
 
 bool romm_config_get_device_id(char *device_id, size_t device_id_size)
 {
