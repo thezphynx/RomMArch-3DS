@@ -89,6 +89,34 @@ INSTALLATION
 The retroarch_3ds.3dsx file is an alternative frontend launch format.
 It is not required for the CIA installation.
 
+HTTP PROXY / MOBILE CONNECTIVITY
+RomMArch includes optional HTTP CONNECT proxy support. This can be used with
+compatible phone hotspot/proxy software to provide TCP Internet access to the
+3DS while away from normal Wi-Fi, including RetroAchievements connectivity.
+
+First configure the same proxy address and port in the stock Nintendo 3DS
+Internet Settings for the active connection and confirm that the system
+Connection Test succeeds. Then open RomMArch -> HTTP Proxy, enter the same
+address/port, enable the proxy, and use Test Connection.
+
+Disable RomMArch's proxy toggle when using a normal network that does not
+require the proxy. After a prolonged sleep/network interruption, fully close
+and relaunch RomMArch before retrying network-dependent features.
+
+AUTOMATIC SYNCHRONIZATION — DEVELOPER PREVIEW
+The Automatic Synchronization toggle currently visible under Save
+Synchronization is present for frontend developer testing only. Leave it OFF
+for normal use with this release package. The bundled public emulator/core CIA
+set has not yet been updated to ship the complete automatic-sync integration.
+Manual synchronization remains the supported save-sync mode for this release.
+
+MANUAL SAVE SYNCHRONIZATION
+Configure platform save directories under Save Synchronization -> Configure
+Core Save Directories, then use Initiate Manual Sync. RomMArch uses RomM
+server updated_at timestamps for remote chronology, normalizes downloaded
+saves to canonical <Title>.srm names locally, and preserves timestamped server
+history when updating the canonical remote save.
+
 CORE COMPATIBILITY
 RomMArch packages Nintendo 3DS emulator cores
 and supporting files from the RetroArch 1.17.0 CIA distribution.
