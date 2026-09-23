@@ -15,6 +15,7 @@ bool romm_session_load(romm_session_t *session);
 bool romm_session_save_exists(const romm_session_t *session);
 
 void romm_session_record_launch(const char *core_path, const char *content_path);
+bool romm_session_set_pending(bool pending);
 bool romm_session_has_pending(void);
 
 #endif

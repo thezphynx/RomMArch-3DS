@@ -66,6 +66,7 @@
 #include "../menu_input.h"
 #include "../../romm/romm_config.h"
 #include "../../romm/romm_library.h"
+#include "../../romm/romm_auto_sync.h"
 
 #include "../../core.h"
 #include "../../configuration.h"
@@ -3800,7 +3801,10 @@ static void rommarch_platforms_request(void)
    char url[1152];
    char headers[896];
 
-   romm_library_clear_platforms();
+   /* Keep the last successful platform list while refreshing. This lets
+    * save-directory configuration remain usable when RomM is temporarily
+    * unavailable. A successful response replaces the cached list. */
+   romm_library_set_error(NULL);
    romm_library_set_loading(true);
 
    if (!rommarch_get_auth(server, sizeof(server), token, sizeof(token),
@@ -10376,9 +10380,28 @@ static int action_ok_romm_save_platform(const char *path,
 {
    long platform_id = label ? strtol(label, NULL, 10) : 0;
    const romm_platform_entry_t *platform = romm_library_find_platform(platform_id);
-   if (platform_id <= 0 || !platform)
+   char stored_name[128];
+   const char *name = NULL;
+
+   if (platform_id <= 0)
       return -1;
-   romm_config_set_save_platform_context(platform_id, platform->name);
+
+   if (platform)
+   {
+      name = platform->name;
+      /* Remember the friendly name once the platform is actually configured,
+       * so the same local settings remain readable on a later offline boot. */
+      romm_config_set_save_platform_stored_name(platform_id, name);
+   }
+   else if (romm_config_get_save_platform_stored_name(platform_id, stored_name, sizeof(stored_name)) && *stored_name)
+      name = stored_name;
+   else
+   {
+      snprintf(stored_name, sizeof(stored_name), "Platform %ld", platform_id);
+      name = stored_name;
+   }
+
+   romm_config_set_save_platform_context(platform_id, name);
    return generic_action_ok_displaylist_push(path, NULL,
          msg_hash_to_str(MENU_ENUM_LABEL_ROMM_SAVE_PLATFORM), type,
          idx, entry_idx, ACTION_OK_DL_ROMM_SAVE_PLATFORM);
@@ -10510,11 +10533,18 @@ typedef struct rommarch_save_sync_op
    char server_content_hash[65];
    char server_updated_at[64];
    char server_download_path[512];
+   bool update_baseline;
 } rommarch_save_sync_op_t;
 
 typedef struct rommarch_save_sync_state
 {
    bool active;
+   rommarch_auto_sync_phase_t auto_phase;
+   bool target_found;
+   char target_content[PATH_MAX_LENGTH];
+   char target_filename[ROMM_LIBRARY_FILENAME_LENGTH];
+   rommarch_auto_sync_complete_cb_t completion_cb;
+   void *completion_userdata;
    char device_id[64];
    long platforms[ROMMARCH_SAVE_SYNC_MAX_PLATFORMS];
    size_t platform_count;
@@ -10565,16 +10595,31 @@ static void rommarch_save_sync_progress_task_handler(retro_task_t *task)
    task_set_progress(task, (int8_t)g_rommarch_save_sync.progress);
 }
 
-static void rommarch_save_sync_progress_start(void)
+static void rommarch_save_sync_progress_push(const char *title)
 {
-   retro_task_t *task = task_init();
+   retro_task_t *task;
+
+   task = task_init();
    if (!task)
       return;
 
    task->handler  = rommarch_save_sync_progress_task_handler;
-   task->title    = strdup("RomMArch: Synchronizing saves");
+   task->title    = strdup(title ? title : "RomMArch: Synchronizing saves");
    task->progress = 0;
    task_queue_push(task);
+}
+
+static void rommarch_save_sync_progress_start(void)
+{
+   /* Automatic phases can chain back-to-back (push old, pull new). A global
+    * umbrella progress task would outlive one phase and accidentally attach
+    * itself to the next. Keep the default persistent progress bar for manual
+    * whole-library sync; selected one-shot automatic lifecycle operations may
+    * opt in explicitly after they have started. */
+   if (g_rommarch_save_sync.auto_phase != 0)
+      return;
+
+   rommarch_save_sync_progress_push("RomMArch: Synchronizing saves");
 }
 
 static void rommarch_save_sync_progress_set(unsigned progress)
@@ -10816,15 +10861,40 @@ static void rommarch_basename_noext(char *out, size_t out_size, const char *path
    if (dot && dot != out) *dot = '\0';
 }
 
-static bool rommarch_is_save_candidate(const char *path)
+static bool rommarch_save_target_matches(const char *rom_filename,
+      const char *content_path)
+{
+   const char *content_base;
+   const char *rom_base;
+   char content_noext[ROMM_LIBRARY_FILENAME_LENGTH];
+   char rom_noext[ROMM_LIBRARY_FILENAME_LENGTH];
+
+   if (!rom_filename || !*rom_filename || !content_path || !*content_path)
+      return false;
+
+   content_base = path_basename(content_path);
+   rom_base     = path_basename(rom_filename);
+
+   if (content_base && rom_base &&
+       string_is_equal_noncase(content_base, rom_base))
+      return true;
+
+   rommarch_basename_noext(content_noext, sizeof(content_noext), content_path);
+   rommarch_basename_noext(rom_noext, sizeof(rom_noext), rom_filename);
+   return *content_noext && *rom_noext &&
+         string_is_equal_noncase(content_noext, rom_noext);
+}
+
+static bool rommarch_is_canonical_save_name(const char *path)
 {
    const char *ext = path_get_extension(path);
-   if (!ext || !*ext) return true;
-   if (string_starts_with_size(ext, "state", STRLEN_CONST("state")) ||
-       string_is_equal_noncase(ext, "png") || string_is_equal_noncase(ext, "jpg") ||
-       string_is_equal_noncase(ext, "jpeg") || string_is_equal_noncase(ext, "bmp"))
-      return false;
-   return true;
+
+   /* Normal RetroArch content uses .srm as the primary battery-backed save.
+    * Cores may also create same-basename auxiliary files (notably .rtc).
+    * Those files must never be treated as RomMArch's canonical save: doing so
+    * can suppress a real .srm pull and later overwrite RomM with auxiliary
+    * data. */
+   return ext && *ext && string_is_equal_noncase(ext, "srm");
 }
 
 static const rommarch_save_sync_rom_t *rommarch_save_find_rom(long rom_id)
@@ -10850,15 +10920,14 @@ static const rommarch_server_save_t *rommarch_save_find_server(long rom_id)
    size_t i;
    const rommarch_server_save_t *best = NULL;
 
-   /* RomM is the chronology authority. When more than one eligible save is
-    * associated with a ROM, select the save with the newest server-issued
-    * updated_at value. ISO-8601 timestamps with a common representation sort
-    * lexicographically, so the 3DS clock is never consulted. Filenames are
-    * deliberately not used to infer which save is newer/authoritative. */
+   /* RomM is the chronology authority, but only among canonical .srm saves.
+    * Same-basename auxiliary files such as .rtc are independent core data and
+    * must not become the source for a pre-launch pull. */
    for (i = 0; i < g_rommarch_save_sync.server_save_count; i++)
    {
       const rommarch_server_save_t *candidate = &g_rommarch_save_sync.server_saves[i];
-      if (candidate->rom_id != rom_id || candidate->missing_from_fs)
+      if (candidate->rom_id != rom_id || candidate->missing_from_fs ||
+          !rommarch_is_canonical_save_name(candidate->file))
          continue;
       if (!best ||
           (*candidate->updated_at && !*best->updated_at) ||
@@ -10976,49 +11045,70 @@ static bool rommarch_json_next_object(const char **cursor, const char *end,
 static void rommarch_save_sync_finish_message(const char *msg,
       enum message_queue_category category)
 {
+   rommarch_auto_sync_complete_cb_t completion_cb =
+         g_rommarch_save_sync.completion_cb;
+   void *completion_userdata = g_rommarch_save_sync.completion_userdata;
+   bool success = (category != MESSAGE_QUEUE_CATEGORY_ERROR) &&
+         g_rommarch_save_sync.failed == 0 &&
+         g_rommarch_save_sync.conflicts == 0;
+
    g_rommarch_save_sync.active = false;
    free(g_rommarch_save_sync.request_body);
    g_rommarch_save_sync.request_body = NULL;
+   g_rommarch_save_sync.completion_cb = NULL;
+   g_rommarch_save_sync.completion_userdata = NULL;
+
    if (msg && *msg)
       runloop_msg_queue_push(msg, strlen(msg), 1, 360, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, category);
    menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+
+   if (completion_cb)
+      completion_cb(success, completion_userdata);
 }
 
 static bool rommarch_save_add_local_files(long rom_id, long platform_id,
       const char *rom_filename, const char *save_dir)
 {
-   struct string_list *list;
    char rom_base[ROMM_LIBRARY_FILENAME_LENGTH];
-   size_t i;
-   if (!save_dir || !*save_dir || !path_is_directory(save_dir))
+   char save_name[ROMM_LIBRARY_FILENAME_LENGTH];
+   char save_path[PATH_MAX_LENGTH];
+   rommarch_save_sync_file_t *f;
+   struct stat st;
+
+   if (!save_dir || !*save_dir || !path_is_directory(save_dir) ||
+       !rom_filename || !*rom_filename)
       return false;
+
+   /* Do not enumerate the save directory. mGBA and other cores may place
+    * auxiliary files such as <game>.rtc beside <game>.srm; directory ordering
+    * is not a valid way to decide which one is the battery save. Resolve the
+    * exact canonical RetroArch save path instead. */
    rommarch_basename_noext(rom_base, sizeof(rom_base), rom_filename);
-   list = dir_list_new(save_dir, NULL, false, false, false, false);
-   if (!list) return true;
-   for (i = 0; i < list->size && g_rommarch_save_sync.file_count < ROMMARCH_SAVE_SYNC_MAX_FILES; i++)
-   {
-      const char *candidate = list->elems[i].data;
-      char candidate_base[ROMM_LIBRARY_FILENAME_LENGTH];
-      rommarch_save_sync_file_t *f;
-      struct stat st;
-      if (!candidate || !*candidate || path_is_directory(candidate) || !rommarch_is_save_candidate(candidate))
-         continue;
-      rommarch_basename_noext(candidate_base, sizeof(candidate_base), candidate);
-      if (!string_is_equal_noncase(candidate_base, rom_base))
-         continue;
-      f = &g_rommarch_save_sync.files[g_rommarch_save_sync.file_count];
-      memset(f, 0, sizeof(*f));
-      f->rom_id = rom_id; f->platform_id = platform_id;
-      strlcpy(f->file, path_basename(candidate), sizeof(f->file));
-      strlcpy(f->path, candidate, sizeof(f->path));
-      if (stat(candidate, &st) != 0 || !rommarch_save_md5_file(candidate, f->content_hash))
-         continue;
-      f->file_size_bytes = (int64_t)st.st_size;
-      g_rommarch_save_sync.file_count++;
-      break; /* One canonical save per ROM. */
-   }
-   string_list_free(list);
+   if (!*rom_base)
+      return true;
+   snprintf(save_name, sizeof(save_name), "%s.srm", rom_base);
+   fill_pathname_join(save_path, save_dir, save_name, sizeof(save_path));
+
+   if (!path_is_valid(save_path) || path_is_directory(save_path))
+      return true;
+
+   if (g_rommarch_save_sync.file_count >= ROMMARCH_SAVE_SYNC_MAX_FILES)
+      return true;
+
+   f = &g_rommarch_save_sync.files[g_rommarch_save_sync.file_count];
+   memset(f, 0, sizeof(*f));
+   f->rom_id = rom_id;
+   f->platform_id = platform_id;
+   strlcpy(f->file, save_name, sizeof(f->file));
+   strlcpy(f->path, save_path, sizeof(f->path));
+
+   if (stat(save_path, &st) != 0 ||
+       !rommarch_save_md5_file(save_path, f->content_hash))
+      return true;
+
+   f->file_size_bytes = (int64_t)st.st_size;
+   g_rommarch_save_sync.file_count++;
    return true;
 }
 
@@ -11027,16 +11117,41 @@ static void rommarch_save_sync_request_server_saves(void);
 static void rommarch_save_sync_execute_next(void);
 static void rommarch_save_sync_register_device(void);
 
+static void rommarch_save_sync_advance_rom_listing(unsigned long total)
+{
+   if (((unsigned long)(g_rommarch_save_sync.page + 1) * ROMMARCH_SAVE_SYNC_PAGE_SIZE) < total)
+   {
+      g_rommarch_save_sync.page++;
+      rommarch_save_sync_request_rom_page();
+      return;
+   }
+
+   g_rommarch_save_sync.platform_index++;
+   g_rommarch_save_sync.page = 0;
+   if (g_rommarch_save_sync.platform_index < g_rommarch_save_sync.platform_count)
+      rommarch_save_sync_request_rom_page();
+   else
+   {
+      if (g_rommarch_save_sync.auto_phase != 0 &&
+          !g_rommarch_save_sync.target_found)
+      {
+         /* The launched content is not a RomM ROM on any save-enabled
+          * platform. This is a normal no-op, not a launch failure. */
+         rommarch_save_sync_finish_message(NULL, MESSAGE_QUEUE_CATEGORY_INFO);
+         return;
+      }
+      g_rommarch_save_sync.save_platform_index = 0;
+      rommarch_save_sync_request_server_saves();
+   }
+}
+
 static void cb_rommarch_save_sync_roms(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
    http_transfer_data_t *data = (http_transfer_data_t*)task_data;
    long platform_id;
    char save_dir[PATH_MAX_LENGTH];
-   char roms_path[768];
-   romm_library_entry_t entries[ROMM_LIBRARY_PAGE_SIZE];
-   size_t n, i;
-   unsigned long total;
+   unsigned long total = 0;
 
    if (!g_rommarch_save_sync.active) return;
    if (err || !data || data->status != 200 || !data->data)
@@ -11055,62 +11170,132 @@ static void cb_rommarch_save_sync_roms(retro_task_t *task, void *task_data,
       return;
    }
 
-   if (!romm_config_get_roms_path(roms_path, sizeof(roms_path)) || !*roms_path)
+   if (g_rommarch_save_sync.auto_phase != 0)
    {
-      rommarch_save_sync_finish_message("RomMArch: Local ROM directory is not configured",
-            MESSAGE_QUEUE_CATEGORY_ERROR);
-      return;
-   }
+      const char *end = data->data + data->len;
+      const char *items = rommarch_json_key(data->data, end, "items");
+      const char *cursor;
+      long total_long = 0;
 
-   if (!romm_library_parse_response(data->data, data->len, platform_id,
-            g_rommarch_save_sync.page, roms_path))
-   {
-      rommarch_save_sync_finish_message("RomMArch: Could not parse ROM list for save sync",
-            MESSAGE_QUEUE_CATEGORY_ERROR);
-      return;
-   }
-   n = romm_library_get_entries(entries, ARRAY_SIZE(entries));
-   total = romm_library_get_total();
-   for (i = 0; i < n; i++)
-   {
-      rommarch_save_sync_rom_t *r;
+      if (rommarch_json_long(data->data, end, "total", &total_long) && total_long > 0)
+         total = (unsigned long)total_long;
 
-      /* Save synchronization only applies to ROMs that are actually present
-       * in RomMArch's configured local ROM directory.  This deliberately uses
-       * the same local_present result as the Rom Library [X] indicator. */
-      if (!entries[i].local_present)
-         continue;
-
-      if (g_rommarch_save_sync.rom_count >= ROMMARCH_SAVE_SYNC_MAX_ROMS)
+      if (!items)
       {
-         rommarch_save_sync_finish_message("RomMArch: Save sync ROM limit reached (512)",
+         rommarch_save_sync_finish_message("RomMArch: Could not parse ROM list for automatic save sync",
                MESSAGE_QUEUE_CATEGORY_ERROR);
          return;
       }
-      r = &g_rommarch_save_sync.roms[g_rommarch_save_sync.rom_count++];
-      memset(r, 0, sizeof(*r));
-      r->rom_id = entries[i].rom_id; r->platform_id = platform_id;
-      strlcpy(r->rom_filename, entries[i].filename, sizeof(r->rom_filename));
-      strlcpy(r->save_dir, save_dir, sizeof(r->save_dir));
-      rommarch_save_add_local_files(r->rom_id, platform_id, r->rom_filename, save_dir);
-   }
+      items = rommarch_json_skip(items, end);
+      if (items >= end || *items != ':')
+      {
+         rommarch_save_sync_finish_message("RomMArch: Could not parse ROM list for automatic save sync",
+               MESSAGE_QUEUE_CATEGORY_ERROR);
+         return;
+      }
+      items = rommarch_json_skip(items + 1, end);
+      if (items >= end || *items != '[')
+      {
+         rommarch_save_sync_finish_message("RomMArch: Could not parse ROM list for automatic save sync",
+               MESSAGE_QUEUE_CATEGORY_ERROR);
+         return;
+      }
 
-   if (((unsigned long)(g_rommarch_save_sync.page + 1) * ROMMARCH_SAVE_SYNC_PAGE_SIZE) < total)
-   {
-      g_rommarch_save_sync.page++;
-      rommarch_save_sync_request_rom_page();
+      cursor = items + 1;
+      while (cursor < end)
+      {
+         const char *obj_start, *obj_end;
+         long rom_id = 0;
+         char filename[ROMM_LIBRARY_FILENAME_LENGTH];
+         rommarch_save_sync_rom_t *r;
+
+         filename[0] = '\0';
+         if (!rommarch_json_next_object(&cursor, end, &obj_start, &obj_end))
+            break;
+         if (!rommarch_json_long(obj_start, obj_end, "id", &rom_id) || rom_id <= 0)
+            continue;
+         if (!rommarch_json_string_get(obj_start, obj_end, "fs_name", filename, sizeof(filename)))
+            rommarch_json_string_get(obj_start, obj_end, "file_name", filename, sizeof(filename));
+         if (!*filename || !rommarch_save_target_matches(filename,
+                  g_rommarch_save_sync.target_content))
+            continue;
+
+         if (g_rommarch_save_sync.rom_count >= ROMMARCH_SAVE_SYNC_MAX_ROMS)
+         {
+            rommarch_save_sync_finish_message("RomMArch: Save sync ROM limit reached (512)",
+                  MESSAGE_QUEUE_CATEGORY_ERROR);
+            return;
+         }
+
+         r = &g_rommarch_save_sync.roms[g_rommarch_save_sync.rom_count++];
+         memset(r, 0, sizeof(*r));
+         r->rom_id = rom_id;
+         r->platform_id = platform_id;
+         strlcpy(r->rom_filename, filename, sizeof(r->rom_filename));
+         strlcpy(r->save_dir, save_dir, sizeof(r->save_dir));
+         rommarch_save_add_local_files(r->rom_id, platform_id, r->rom_filename, save_dir);
+
+         /* One exact launched ROM is the complete automatic-sync scope. */
+         g_rommarch_save_sync.target_found = true;
+         g_rommarch_save_sync.platforms[0] = platform_id;
+         g_rommarch_save_sync.platform_count = 1;
+         g_rommarch_save_sync.platform_index = 1;
+         g_rommarch_save_sync.save_platform_index = 0;
+         rommarch_save_sync_request_server_saves();
+         return;
+      }
+
+      rommarch_save_sync_advance_rom_listing(total);
       return;
    }
-
-   g_rommarch_save_sync.platform_index++;
-   g_rommarch_save_sync.page = 0;
-   if (g_rommarch_save_sync.platform_index < g_rommarch_save_sync.platform_count)
-      rommarch_save_sync_request_rom_page();
    else
    {
-      g_rommarch_save_sync.save_platform_index = 0;
-      rommarch_save_sync_request_server_saves();
+      char roms_path[768];
+      romm_library_entry_t entries[ROMM_LIBRARY_PAGE_SIZE];
+      size_t n, i;
+
+      if (!romm_config_get_roms_path(roms_path, sizeof(roms_path)) || !*roms_path)
+      {
+         rommarch_save_sync_finish_message("RomMArch: Local ROM directory is not configured",
+               MESSAGE_QUEUE_CATEGORY_ERROR);
+         return;
+      }
+
+      if (!romm_library_parse_response(data->data, data->len, platform_id,
+               g_rommarch_save_sync.page, roms_path))
+      {
+         rommarch_save_sync_finish_message("RomMArch: Could not parse ROM list for save sync",
+               MESSAGE_QUEUE_CATEGORY_ERROR);
+         return;
+      }
+      n = romm_library_get_entries(entries, ARRAY_SIZE(entries));
+      total = romm_library_get_total();
+      for (i = 0; i < n; i++)
+      {
+         rommarch_save_sync_rom_t *r;
+
+         /* Manual synchronization retains its existing whole-library rule:
+          * only ROMs present in RomMArch's configured local ROM directory are
+          * included. */
+         if (!entries[i].local_present)
+            continue;
+
+         if (g_rommarch_save_sync.rom_count >= ROMMARCH_SAVE_SYNC_MAX_ROMS)
+         {
+            rommarch_save_sync_finish_message("RomMArch: Save sync ROM limit reached (512)",
+                  MESSAGE_QUEUE_CATEGORY_ERROR);
+            return;
+         }
+         r = &g_rommarch_save_sync.roms[g_rommarch_save_sync.rom_count++];
+         memset(r, 0, sizeof(*r));
+         r->rom_id = entries[i].rom_id; r->platform_id = platform_id;
+         strlcpy(r->rom_filename, entries[i].filename, sizeof(r->rom_filename));
+         strlcpy(r->save_dir, save_dir, sizeof(r->save_dir));
+         rommarch_save_add_local_files(r->rom_id, platform_id, r->rom_filename, save_dir);
+      }
    }
+
+   rommarch_save_sync_advance_rom_listing(total);
 }
 
 static void rommarch_save_sync_request_rom_page(void)
@@ -11216,24 +11401,83 @@ static void rommarch_save_build_operations(void)
       }
       if (local) strlcpy(op->local_content_hash, local->content_hash, sizeof(op->local_content_hash));
 
-      if (local && !server)
-         op->type = ROMMARCH_SAVE_OP_UPLOAD;
-      else if (!local && server)
-         op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
-      else if (!*local->content_hash || !*server->content_hash)
-         op->type = ROMMARCH_SAVE_OP_CONFLICT;
-      else if (string_is_equal_noncase(local->content_hash, server->content_hash))
-         op->type = ROMMARCH_SAVE_OP_NOOP;
-      else if (!have_last)
-         op->type = ROMMARCH_SAVE_OP_CONFLICT;
-      else if (string_is_equal_noncase(local->content_hash, last_hash) &&
-               !string_is_equal_noncase(server->content_hash, last_hash))
-         op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
-      else if (!string_is_equal_noncase(local->content_hash, last_hash) &&
-               string_is_equal_noncase(server->content_hash, last_hash))
-         op->type = ROMMARCH_SAVE_OP_UPLOAD;
+      if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PULL)
+      {
+         /* Before launch, the network side is allowed to replace the local
+          * save, but a locally-newer save is deferred until content close. */
+         if (local && !server)
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+         else if (!local && server)
+            op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
+         else if (!*local->content_hash || !*server->content_hash)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, server->content_hash))
+         {
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+            op->update_baseline = true;
+         }
+         else if (!have_last)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, last_hash) &&
+                  !string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
+         else if (!string_is_equal_noncase(local->content_hash, last_hash) &&
+                  string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+         else
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+      }
+      else if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PUSH)
+      {
+         /* On content close, the local side is allowed to update RomM, but a
+          * remotely-newer save is left alone for the next pre-launch pull. */
+         if (local && !server)
+            op->type = ROMMARCH_SAVE_OP_UPLOAD;
+         else if (!local && server)
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+         else if (!*local->content_hash || !*server->content_hash)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, server->content_hash))
+         {
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+            op->update_baseline = true;
+         }
+         else if (!have_last)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, last_hash) &&
+                  !string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+         else if (!string_is_equal_noncase(local->content_hash, last_hash) &&
+                  string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_UPLOAD;
+         else
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+      }
       else
-         op->type = ROMMARCH_SAVE_OP_CONFLICT;
+      {
+         /* Existing manual two-way synchronization semantics. */
+         if (local && !server)
+            op->type = ROMMARCH_SAVE_OP_UPLOAD;
+         else if (!local && server)
+            op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
+         else if (!*local->content_hash || !*server->content_hash)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, server->content_hash))
+         {
+            op->type = ROMMARCH_SAVE_OP_NOOP;
+            op->update_baseline = true;
+         }
+         else if (!have_last)
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+         else if (string_is_equal_noncase(local->content_hash, last_hash) &&
+                  !string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
+         else if (!string_is_equal_noncase(local->content_hash, last_hash) &&
+                  string_is_equal_noncase(server->content_hash, last_hash))
+            op->type = ROMMARCH_SAVE_OP_UPLOAD;
+         else
+            op->type = ROMMARCH_SAVE_OP_CONFLICT;
+      }
 
       if (op->type == ROMMARCH_SAVE_OP_UPLOAD ||
           op->type == ROMMARCH_SAVE_OP_DOWNLOAD)
@@ -11289,15 +11533,40 @@ static void rommarch_save_sync_request_server_saves(void)
 static void rommarch_save_sync_finish_counts(void)
 {
    char msg[256];
-   rommarch_save_sync_progress_set(99);
-   snprintf(msg, sizeof(msg),
-         "RomMArch: Save sync complete - %u pushed, %u pulled, %u unchanged, %u conflicts, %u failed",
-         g_rommarch_save_sync.uploaded, g_rommarch_save_sync.downloaded,
-         g_rommarch_save_sync.noops, g_rommarch_save_sync.conflicts,
-         g_rommarch_save_sync.failed);
-   rommarch_save_sync_finish_message(msg,
+   enum message_queue_category category =
          (g_rommarch_save_sync.conflicts || g_rommarch_save_sync.failed) ?
-         MESSAGE_QUEUE_CATEGORY_WARNING : MESSAGE_QUEUE_CATEGORY_INFO);
+         MESSAGE_QUEUE_CATEGORY_WARNING : MESSAGE_QUEUE_CATEGORY_INFO;
+
+   rommarch_save_sync_progress_set(99);
+
+   if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PULL)
+   {
+      if (g_rommarch_save_sync.downloaded)
+         strlcpy(msg, "RomMArch: Save synchronized before launch", sizeof(msg));
+      else if (g_rommarch_save_sync.conflicts || g_rommarch_save_sync.failed)
+         strlcpy(msg, "RomMArch: Pre-launch save check completed with issues", sizeof(msg));
+      else
+         strlcpy(msg, "RomMArch: Save is current", sizeof(msg));
+   }
+   else if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PUSH)
+   {
+      if (g_rommarch_save_sync.uploaded)
+         strlcpy(msg, "RomMArch: Save synchronized to server", sizeof(msg));
+      else if (g_rommarch_save_sync.conflicts || g_rommarch_save_sync.failed)
+         strlcpy(msg, "RomMArch: Save upload check completed with issues", sizeof(msg));
+      else
+         strlcpy(msg, "RomMArch: Server save is current", sizeof(msg));
+   }
+   else
+   {
+      snprintf(msg, sizeof(msg),
+            "RomMArch: Save sync complete - %u pushed, %u pulled, %u unchanged, %u conflicts, %u failed",
+            g_rommarch_save_sync.uploaded, g_rommarch_save_sync.downloaded,
+            g_rommarch_save_sync.noops, g_rommarch_save_sync.conflicts,
+            g_rommarch_save_sync.failed);
+   }
+
+   rommarch_save_sync_finish_message(msg, category);
 }
 
 static void rommarch_save_sync_diagnostic(const char *detail, const rommarch_save_sync_op_t *op)
@@ -11442,15 +11711,52 @@ static void rommarch_save_sync_conflict_choice(unsigned choice)
 
    if (choice == 1)
    {
-      /* User explicitly chose the 3DS copy as authoritative. */
-      op->type = ROMMARCH_SAVE_OP_UPLOAD;
-      g_rommarch_save_sync.transfer_count++;
+      /* "Use 3DS Save" is phase-aware. A pre-launch pull never uploads;
+       * choosing the local copy simply launches with it. */
+      if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PULL)
+      {
+         /* Remember the current RomM hash as the common point. On content
+          * close this makes the user's local choice resolve naturally as an
+          * upload, without asking about the same conflict twice. */
+         if (*op->server_content_hash &&
+             !romm_config_set_save_sync_hash(op->rom_id, op->server_content_hash))
+         {
+            rommarch_save_sync_diagnostic("conflict choice could not be remembered", op);
+            g_rommarch_save_sync.failed++;
+         }
+         op->type = ROMMARCH_SAVE_OP_NOOP;
+         op->update_baseline = false;
+      }
+      else
+      {
+         op->type = ROMMARCH_SAVE_OP_UPLOAD;
+         g_rommarch_save_sync.transfer_count++;
+      }
    }
    else if (choice == 2)
    {
-      /* User explicitly chose the RomM copy as authoritative. */
-      op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
-      g_rommarch_save_sync.transfer_count++;
+      /* "Use RomM Save" is likewise phase-aware. On close we never replace
+       * the just-written local save; the remote copy can be pulled safely on
+       * the next launch instead. */
+      if (g_rommarch_save_sync.auto_phase == ROMMARCH_AUTO_SYNC_PUSH)
+      {
+         /* Remember the just-flushed 3DS hash as the common point. The next
+          * pre-launch pull will then recognize RomM as the chosen newer side
+          * and install it before gameplay begins. */
+         if (*op->local_content_hash &&
+             !romm_config_set_save_sync_hash(op->rom_id, op->local_content_hash))
+         {
+            rommarch_save_sync_diagnostic("conflict choice could not be remembered", op);
+            g_rommarch_save_sync.failed++;
+         }
+         op->type = ROMMARCH_SAVE_OP_NOOP;
+         op->update_baseline = false;
+      }
+      else
+      {
+         op->type = ROMMARCH_SAVE_OP_DOWNLOAD;
+         g_rommarch_save_sync.transfer_count++;
+      }
    }
    else
    {
@@ -11469,7 +11775,7 @@ static void rommarch_save_sync_execute_next(void)
       rommarch_save_sync_op_t *op = &g_rommarch_save_sync.ops[g_rommarch_save_sync.op_index];
       if (op->type == ROMMARCH_SAVE_OP_NOOP)
       {
-         if (*op->local_content_hash)
+         if (op->update_baseline && *op->local_content_hash)
             romm_config_set_save_sync_hash(op->rom_id, op->local_content_hash);
          g_rommarch_save_sync.noops++;
          g_rommarch_save_sync.op_index++;
@@ -11659,6 +11965,130 @@ static void rommarch_save_sync_register_device(void)
 
 #endif
 
+bool rommarch_auto_sync_active(void)
+{
+#ifdef HAVE_NETWORKING
+   return g_rommarch_save_sync.active && g_rommarch_save_sync.auto_phase != 0;
+#else
+   return false;
+#endif
+}
+
+bool rommarch_save_sync_busy(void)
+{
+#ifdef HAVE_NETWORKING
+   return g_rommarch_save_sync.active;
+#else
+   return false;
+#endif
+}
+
+void rommarch_auto_sync_show_progress(void)
+{
+#ifdef HAVE_NETWORKING
+   if (!g_rommarch_save_sync.active || g_rommarch_save_sync.auto_phase == 0)
+      return;
+
+   rommarch_save_sync_progress_push("RomMArch: Synchronizing save");
+#endif
+}
+
+bool rommarch_auto_sync_blocks_menu(void)
+{
+#ifdef HAVE_NETWORKING
+   if (!g_rommarch_save_sync.active || g_rommarch_save_sync.auto_phase == 0)
+      return false;
+
+   /* Conflict resolution is intentionally interactive. Once a choice is
+    * made, execute_next() advances/resumes and normal input blocking applies
+    * again until the automatic sync finishes. */
+   if (g_rommarch_save_sync.op_index < g_rommarch_save_sync.op_count &&
+       g_rommarch_save_sync.ops[g_rommarch_save_sync.op_index].type ==
+             ROMMARCH_SAVE_OP_CONFLICT)
+      return false;
+
+   return true;
+#else
+   return false;
+#endif
+}
+
+bool rommarch_auto_sync_start(const char *content_path,
+      rommarch_auto_sync_phase_t phase,
+      rommarch_auto_sync_complete_cb_t callback, void *userdata)
+{
+#ifdef HAVE_NETWORKING
+   char token[768];
+   size_t count;
+
+   if (!romm_config_get_automatic_sync() ||
+       !content_path || !*content_path ||
+       (phase != ROMMARCH_AUTO_SYNC_PULL && phase != ROMMARCH_AUTO_SYNC_PUSH) ||
+       g_rommarch_save_sync.active)
+      return false;
+
+   memset(&g_rommarch_save_sync, 0, sizeof(g_rommarch_save_sync));
+   g_rommarch_save_sync.auto_phase = phase;
+   g_rommarch_save_sync.completion_cb = callback;
+   g_rommarch_save_sync.completion_userdata = userdata;
+   strlcpy(g_rommarch_save_sync.target_content, content_path,
+         sizeof(g_rommarch_save_sync.target_content));
+   {
+      const char *target_base = path_basename(content_path);
+      if (target_base)
+         strlcpy(g_rommarch_save_sync.target_filename, target_base,
+               sizeof(g_rommarch_save_sync.target_filename));
+   }
+
+   if (!rommarch_get_auth(g_rommarch_save_sync.server,
+            sizeof(g_rommarch_save_sync.server), token, sizeof(token),
+            g_rommarch_save_sync.headers, sizeof(g_rommarch_save_sync.headers)))
+   {
+      memset(&g_rommarch_save_sync, 0, sizeof(g_rommarch_save_sync));
+      return false;
+   }
+
+   count = romm_config_get_ready_save_platforms(
+         g_rommarch_save_sync.platforms,
+         ARRAY_SIZE(g_rommarch_save_sync.platforms));
+   g_rommarch_save_sync.platform_count = count;
+   if (!count)
+   {
+      memset(&g_rommarch_save_sync, 0, sizeof(g_rommarch_save_sync));
+      return false;
+   }
+
+   g_rommarch_save_sync.active = true;
+   rommarch_save_sync_progress_set(5);
+   rommarch_save_sync_progress_start();
+
+   if (romm_config_get_device_id(g_rommarch_save_sync.device_id,
+            sizeof(g_rommarch_save_sync.device_id)) &&
+       *g_rommarch_save_sync.device_id)
+      rommarch_save_sync_request_rom_page();
+   else
+      rommarch_save_sync_register_device();
+
+   return true;
+#else
+   (void)content_path;
+   (void)phase;
+   (void)callback;
+   (void)userdata;
+   return false;
+#endif
+}
+
+static int action_ok_romm_save_automatic(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   bool enabled = romm_config_get_automatic_sync();
+   if (!romm_config_set_automatic_sync(!enabled))
+      return -1;
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
+}
+
 static int action_ok_romm_save_synchronize(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -11832,6 +12262,8 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
       BIND_ACTION_OK(cbs, action_ok_romm_save_enable);
    else if (type == MENU_SETTING_ACTION_ROMM_SAVE_PATH)
       BIND_ACTION_OK(cbs, action_ok_romm_save_path);
+   else if (type == MENU_SETTING_ACTION_ROMM_SAVE_AUTOMATIC)
+      BIND_ACTION_OK(cbs, action_ok_romm_save_automatic);
    else if (type == MENU_SETTING_ACTION_ROMM_SAVE_SYNCHRONIZE)
       BIND_ACTION_OK(cbs, action_ok_romm_save_synchronize);
    else if (type == MENU_SET_CDROM_LIST)

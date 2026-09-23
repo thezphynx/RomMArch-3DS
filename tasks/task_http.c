@@ -360,10 +360,23 @@ static void task_http_transfer_cleanup(retro_task_t *task)
 static bool task_http_finder(retro_task_t *task, void *user_data)
 {
    http_handle_t *http = NULL;
-   if (task && (task->handler == task_http_transfer_handler) && user_data)
-      if ((http = (http_handle_t*)task->state))
-         return http->connection_url
-             && string_is_equal(http->connection_url, (const char*)user_data);
+
+   if (!task || task->handler != task_http_transfer_handler || !user_data)
+      return false;
+
+   /* Finished HTTP tasks remain visible to task_queue_find() until the
+    * retirement/cleanup phase.  They must not continue blocking a new GET
+    * for the same URL: in particular, a failed direct request on 3DS may be
+    * followed immediately by a retry after the RomMArch proxy is enabled.
+    * The state object is intentionally kept alive until cleanup, so checking
+    * the FINISHED flag here is both safe and sufficient. */
+   if ((task_get_flags(task) & RETRO_TASK_FLG_FINISHED) != 0)
+      return false;
+
+   if ((http = (http_handle_t*)task->state))
+      return http->connection_url
+          && string_is_equal(http->connection_url, (const char*)user_data);
+
    return false;
 }
 

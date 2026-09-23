@@ -18,11 +18,18 @@ bool romm_config_set_http_proxy_host(const char *value);
 unsigned romm_config_get_http_proxy_port(void);
 bool romm_config_set_http_proxy_port(unsigned port);
 
+bool romm_config_get_automatic_sync(void);
+bool romm_config_set_automatic_sync(bool enabled);
+
 bool romm_config_get_save_enabled(long platform_id);
 bool romm_config_set_save_enabled(long platform_id, bool enabled);
 bool romm_config_get_save_path(long platform_id, char *out, size_t out_size);
 bool romm_config_set_save_path(long platform_id, const char *value);
 bool romm_config_save_ready(long platform_id);
+bool romm_config_get_save_platform_stored_name(long platform_id, char *out, size_t out_size);
+bool romm_config_set_save_platform_stored_name(long platform_id, const char *name);
+size_t romm_config_get_known_save_platforms(long *out, size_t max_entries);
+size_t romm_config_get_ready_save_platforms(long *out, size_t max_entries);
 bool romm_config_get_device_id(char *device_id, size_t device_id_size);
 bool romm_config_set_device_id(const char *device_id);
 bool romm_config_get_save_sync_hash(long rom_id, char *out, size_t out_size);

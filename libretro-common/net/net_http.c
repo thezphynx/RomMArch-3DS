@@ -100,7 +100,9 @@ enum bodytype
 struct conn_pool_entry
 {
    char *domain;
+   char *proxy_host;
    int port;
+   int proxy_port;
    int fd;
    void *ssl_ctx;
    bool ssl;
@@ -793,6 +795,7 @@ static void net_http_conn_pool_free(struct conn_pool_entry *entry)
    if (entry->fd >= 0)
       socket_close(entry->fd);
    free(entry->domain);
+   free(entry->proxy_host);
    free(entry);
 }
 
@@ -904,8 +907,26 @@ static void net_http_conn_pool_move_to_end(struct conn_pool_entry *entry)
       entry->next = NULL;
 }
 
+static bool net_http_conn_pool_proxy_matches(
+      const struct conn_pool_entry *entry,
+      const char *proxy_host, int proxy_port)
+{
+   bool entry_has_proxy = entry && entry->proxy_host && *entry->proxy_host;
+   bool request_has_proxy = proxy_host && *proxy_host && proxy_port > 0;
+
+   if (entry_has_proxy != request_has_proxy)
+      return false;
+
+   if (!entry_has_proxy)
+      return true;
+
+   return entry->proxy_port == proxy_port
+       && strcmp(entry->proxy_host, proxy_host) == 0;
+}
+
 static struct conn_pool_entry *net_http_conn_pool_find(
-   const char *domain, int port)
+   const char *domain, int port, bool ssl,
+   const char *proxy_host, int proxy_port)
 {
    struct conn_pool_entry *entry;
 
@@ -916,9 +937,11 @@ static struct conn_pool_entry *net_http_conn_pool_find(
    entry = conn_pool;
    while (entry)
    {
-      if (  !entry->in_use 
+      if (  !entry->in_use
           && port == entry->port
-          && strcmp(entry->domain, domain) == 0)
+          && ssl == entry->ssl
+          && strcmp(entry->domain, domain) == 0
+          && net_http_conn_pool_proxy_matches(entry, proxy_host, proxy_port))
       {
          entry->in_use = true;
          net_http_conn_pool_move_to_end(entry);
@@ -931,13 +954,34 @@ static struct conn_pool_entry *net_http_conn_pool_find(
    return NULL;
 }
 
-static struct conn_pool_entry *net_http_conn_pool_add(const char *domain, int port, int fd, bool ssl)
+static struct conn_pool_entry *net_http_conn_pool_add(
+      const char *domain, int port, int fd, bool ssl,
+      const char *proxy_host, int proxy_port)
 {
    struct conn_pool_entry *entry = (struct conn_pool_entry*)
       calloc(1, sizeof(*entry));
    if (!entry)
       return NULL;
+
    entry->domain = strdup(domain);
+   if (!entry->domain)
+   {
+      free(entry);
+      return NULL;
+   }
+
+   if (proxy_host && *proxy_host && proxy_port > 0)
+   {
+      entry->proxy_host = strdup(proxy_host);
+      if (!entry->proxy_host)
+      {
+         free(entry->domain);
+         free(entry);
+         return NULL;
+      }
+      entry->proxy_port = proxy_port;
+   }
+
    entry->port = port;
    entry->fd = fd;
    entry->in_use = true;
@@ -1172,7 +1216,17 @@ static bool net_http_new_socket(struct http_t *state)
          addr = entry->addr;
          fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
          if (fd >= 0)
-            state->conn = net_http_conn_pool_add(state->request.domain, state->request.port, fd, state->ssl);
+         {
+            state->conn = net_http_conn_pool_add(
+                  state->request.domain, state->request.port, fd, state->ssl,
+                  state->proxy_host, state->proxy_port);
+            if (!state->conn)
+            {
+               socket_close(fd);
+               fd = -1;
+               net_http_log_transport_state(state, "conn_pool_add_failed", -1);
+            }
+         }
          else
             net_http_log_transport_state(state, "socket_create_failed", -1);
          /* still waiting on thread */
@@ -2214,7 +2268,9 @@ bool net_http_update(struct http_t *state, size_t* progress, size_t* total)
 
    if (!state->conn)
    {
-      state->conn = net_http_conn_pool_find(state->request.domain, state->request.port);
+      state->conn = net_http_conn_pool_find(
+            state->request.domain, state->request.port, state->ssl,
+            state->proxy_host, state->proxy_port);
       if (!state->conn)
       {
          if (!net_http_new_socket(state))
@@ -2402,13 +2458,35 @@ bool net_http_update(struct http_t *state, size_t* progress, size_t* total)
    if (response->part != P_DONE)
       return false;
 
-   for (_len = 0; (size_t)_len < response->headers->size; _len++)
+   /* CONNECT tunnels are deliberately not kept alive in the pool.
+    *
+    * A proxy socket can remain locally open after the proxy, hotspot or
+    * upstream path has silently discarded the tunnel.  select() sees no
+    * readable EOF in that state, so net_http_conn_pool_remove_expired()
+    * considers the entry reusable.  A later request can then write to the
+    * stale tunnel and wait forever for a response.  This is especially easy
+    * to hit on 3DS when RomMArch toggles its HTTP proxy OFF/ON at runtime.
+    *
+    * Keep direct connections pooled, but close every proxied transport once
+    * its request completes.  A subsequent proxied request establishes a new
+    * TCP connection + CONNECT tunnel, making runtime proxy switching
+    * deterministic and preventing a dead tunnel from poisoning later HTTP
+    * tasks. */
+   if (state->proxy_host && *state->proxy_host)
    {
-      if (string_is_equal_case_insensitive(response->headers->elems[_len].data, "connection: close"))
+      net_http_conn_pool_remove(state->conn);
+      state->conn = NULL;
+   }
+   else
+   {
+      for (_len = 0; (size_t)_len < response->headers->size; _len++)
       {
-         net_http_conn_pool_remove(state->conn);
-         state->conn = NULL;
-         break;
+         if (string_is_equal_case_insensitive(response->headers->elems[_len].data, "connection: close"))
+         {
+            net_http_conn_pool_remove(state->conn);
+            state->conn = NULL;
+            break;
+         }
       }
    }
 

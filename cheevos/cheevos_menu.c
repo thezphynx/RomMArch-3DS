@@ -427,7 +427,14 @@ void rcheevos_menu_populate(void* data, bool cheevos_enable,
             break;
          }
 
+#ifndef __3DS__
+         /*
+          * RGUI does not display achievement-list badge textures.
+          * Avoid eagerly decoding/allocating one texture per achievement
+          * on Nintendo 3DS when populating the Achievements menu.
+          */
          rcheevos_menu_update_badge(menuitem, false);
+#endif
       }
    }
 

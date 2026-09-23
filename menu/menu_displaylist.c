@@ -8051,28 +8051,34 @@ unsigned menu_displaylist_build_list(
             size_t num_platforms = romm_library_get_platforms(platforms, ROMM_LIBRARY_MAX_PLATFORMS);
             const char *error = romm_library_get_error();
             char server[768], token[768];
+            long ready_platforms[ROMM_LIBRARY_MAX_PLATFORMS];
+            size_t ready_count;
             bool have_server = romm_config_get_server_url(server, sizeof(server)) && *server;
             bool have_token = romm_config_get_api_token(token, sizeof(token)) && *token;
-            bool any_ready = false;
+            bool connected;
+            bool manual_available;
+            const char *manual_label;
 
+            (void)platforms;
+            (void)num_platforms;
             romm_config_cleanup_legacy_save_path();
+            ready_count = romm_config_get_ready_save_platforms(ready_platforms, ARRAY_SIZE(ready_platforms));
+            connected = have_server && have_token && !romm_library_is_loading() && !(error && *error);
+            manual_available = connected && ready_count > 0;
 
-            for (i = 0; i < num_platforms; i++)
-               if (romm_config_save_ready(platforms[i].platform_id))
-               {
-                  any_ready = true;
-                  break;
-               }
-
-            if (!have_server || !have_token)
+            if (!have_server)
             {
-               const char *missing = !have_server ? "Configure RomM Server Address first" : "Configure RomM API Token first";
-               if (menu_entries_append(list, missing, "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+               if (menu_entries_append(list, "RomM Library: Server not configured", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+                     MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
+            }
+            else if (!have_token)
+            {
+               if (menu_entries_append(list, "RomM Library: API token not configured", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
                      MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
             }
             else if (romm_library_is_loading())
             {
-               if (menu_entries_append(list, "Loading RomM platforms...", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+               if (menu_entries_append(list, "RomM Library: Connecting...", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
                      MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
             }
             else if (error && *error)
@@ -8082,15 +8088,33 @@ unsigned menu_displaylist_build_list(
             }
             else
             {
-               if (menu_entries_append(list, "Configure Core Save Directories", "romm_save_directories",
-                     MENU_ENUM_LABEL_ROMM_SAVE_DIRECTORIES, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+               if (menu_entries_append(list, "RomM Library: Connected", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+                     MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
+            }
 
-               if (menu_entries_append(list,
-                     any_ready ? "Initiate Sync" : "Initiate Sync (Unavailable)",
-                     "rommarch_save_synchronize", MENU_ENUM_LABEL_VALUE_UNKNOWN,
-                     any_ready ? MENU_SETTING_ACTION_ROMM_SAVE_SYNCHRONIZE : MENU_SETTING_NO_ITEM,
+            if (menu_entries_append(list, "Configure Core Save Directories", "romm_save_directories",
+                  MENU_ENUM_LABEL_ROMM_SAVE_DIRECTORIES, MENU_SETTING_ACTION, 0, 0, NULL)) count++;
+            {
+               char auto_row[64];
+               bool automatic_sync = romm_config_get_automatic_sync();
+               snprintf(auto_row, sizeof(auto_row), "[%c] Automatic Synchronization",
+                     automatic_sync ? 'X' : ' ');
+               if (menu_entries_append(list, auto_row, "rommarch_save_automatic",
+                     MENU_ENUM_LABEL_VALUE_UNKNOWN, MENU_SETTING_ACTION_ROMM_SAVE_AUTOMATIC,
                      0, 0, NULL)) count++;
             }
+
+            if (!ready_count)
+               manual_label = "Initiate Manual Sync (No Save Directories)";
+            else if (!connected)
+               manual_label = "Initiate Manual Sync (No Network Connection)";
+            else
+               manual_label = "Initiate Manual Sync";
+
+            if (menu_entries_append(list, manual_label,
+                  "rommarch_save_synchronize", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+                  manual_available ? MENU_SETTING_ACTION_ROMM_SAVE_SYNCHRONIZE : MENU_SETTING_NO_ITEM,
+                  0, 0, NULL)) count++;
          }
          break;
       case DISPLAYLIST_ROMM_SAVE_DIRECTORIES:
@@ -8098,10 +8122,11 @@ unsigned menu_displaylist_build_list(
             romm_platform_entry_t platforms[ROMM_LIBRARY_MAX_PLATFORMS];
             size_t num_platforms = romm_library_get_platforms(platforms, ROMM_LIBRARY_MAX_PLATFORMS);
             const char *error = romm_library_get_error();
+            bool showed_platforms = false;
 
             if (romm_library_is_loading())
             {
-               if (menu_entries_append(list, "Loading RomM platforms...", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
+               if (menu_entries_append(list, "RomM Library: Refreshing platforms...", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
                      MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
             }
             else if (error && *error)
@@ -8109,23 +8134,57 @@ unsigned menu_displaylist_build_list(
                if (menu_entries_append(list, error, "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
                      MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
             }
-            else if (!num_platforms)
-            {
-               if (menu_entries_append(list, "No RomM platforms returned", "", MENU_ENUM_LABEL_VALUE_UNKNOWN,
-                     MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
-            }
-            else
+
+            if (num_platforms)
             {
                for (i = 0; i < num_platforms; i++)
                {
                   char platform_id[32];
                   char status[ROMM_LIBRARY_PLATFORM_LENGTH + 16];
+
+                  /* Cache every friendly name while the live RomM platform
+                   * list is available.  Offline reconstruction later has only
+                   * platform IDs from rommarch.cfg; persisting names here keeps
+                   * Configure Core Save Directories readable without network
+                   * access, even for platforms the user never opened online. */
+                  if (platforms[i].platform_id > 0 && platforms[i].name[0])
+                     romm_config_set_save_platform_stored_name(
+                           platforms[i].platform_id, platforms[i].name);
+
                   snprintf(platform_id, sizeof(platform_id), "%ld", platforms[i].platform_id);
                   snprintf(status, sizeof(status), "%s [%s]", platforms[i].name,
                         romm_config_save_ready(platforms[i].platform_id) ? "ON" : "OFF");
                   if (menu_entries_append(list, status, platform_id, MENU_ENUM_LABEL_VALUE_UNKNOWN,
                         MENU_SETTING_ACTION_ROMM_SAVE_PLATFORM, 0, 0, NULL)) count++;
                }
+               showed_platforms = true;
+            }
+            else
+            {
+               long known_ids[ROMM_LIBRARY_MAX_PLATFORMS];
+               size_t known_count = romm_config_get_known_save_platforms(known_ids, ARRAY_SIZE(known_ids));
+               size_t j;
+
+               for (j = 0; j < known_count; j++)
+               {
+                  char platform_id[32];
+                  char platform_name[ROMM_LIBRARY_PLATFORM_LENGTH];
+                  char status[ROMM_LIBRARY_PLATFORM_LENGTH + 16];
+                  if (!romm_config_get_save_platform_stored_name(known_ids[j], platform_name, sizeof(platform_name)) || !*platform_name)
+                     snprintf(platform_name, sizeof(platform_name), "Platform %ld", known_ids[j]);
+                  snprintf(platform_id, sizeof(platform_id), "%ld", known_ids[j]);
+                  snprintf(status, sizeof(status), "%s [%s]", platform_name,
+                        romm_config_save_ready(known_ids[j]) ? "ON" : "OFF");
+                  if (menu_entries_append(list, status, platform_id, MENU_ENUM_LABEL_VALUE_UNKNOWN,
+                        MENU_SETTING_ACTION_ROMM_SAVE_PLATFORM, 0, 0, NULL)) count++;
+                  showed_platforms = true;
+               }
+            }
+
+            if (!showed_platforms && !romm_library_is_loading())
+            {
+               if (menu_entries_append(list, "No saved platform configuration available", "",
+                     MENU_ENUM_LABEL_VALUE_UNKNOWN, MENU_SETTING_NO_ITEM, 0, 0, NULL)) count++;
             }
          }
          break;

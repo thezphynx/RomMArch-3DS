@@ -94,6 +94,7 @@
 #include "task_content_prefetch.h"
 
 #include "../command.h"
+#include "../autosave.h"
 #include "../core_info.h"
 #include "../content.h"
 #include "../core.h"
@@ -107,6 +108,8 @@
 #include "../paths.h"
 #include "../retroarch.h"
 #include "../romm/romm_session.h"
+#include "../romm/romm_config.h"
+#include "../romm/romm_auto_sync.h"
 #include "../runloop.h"
 #include "../verbosity.h"
 
@@ -2415,7 +2418,32 @@ bool task_push_start_dummy_core(content_ctx_info_t *content_info)
 }
 
 #ifdef HAVE_MENU
-bool task_push_load_content_from_playlist_from_menu(
+
+#if defined(__3DS__) && defined(HAVE_NETWORKING)
+typedef enum rommarch_deferred_launch_kind
+{
+   ROMMARCH_DEFERRED_LAUNCH_PLAYLIST = 1,
+   ROMMARCH_DEFERRED_LAUNCH_CURRENT_CORE,
+   ROMMARCH_DEFERRED_LAUNCH_NEW_CORE
+} rommarch_deferred_launch_kind_t;
+
+typedef struct rommarch_deferred_launch
+{
+   bool active;
+   bool ready;
+   bool progress_shown;
+   rommarch_deferred_launch_kind_t kind;
+   enum rarch_core_type core_type;
+   char core_path[PATH_MAX_LENGTH];
+   char fullpath[PATH_MAX_LENGTH];
+   char label[NAME_MAX_LENGTH];
+} rommarch_deferred_launch_t;
+
+static rommarch_deferred_launch_t g_rommarch_deferred_launch;
+static bool g_rommarch_deferred_launch_bypass;
+#endif
+
+static bool task_push_load_content_from_playlist_from_menu_internal(
       const char *core_path,
       const char *fullpath,
       const char *label,
@@ -2453,6 +2481,11 @@ bool task_push_load_content_from_playlist_from_menu(
       if (!content_info->environ_get)
          content_info->environ_get = menu_content_environment_get;
 
+      /* The session must represent the content that is about to become live,
+       * including same-core launches that do not fork a new 3DS process. */
+      if (fullpath && *fullpath)
+         romm_session_record_launch(core_path, fullpath);
+
       /* Register content path */
       path_clear(RARCH_PATH_CONTENT);
       if (fullpath && *fullpath)
@@ -2469,7 +2502,8 @@ bool task_push_load_content_from_playlist_from_menu(
    /* Specified core is not loaded
     * > Load it
     * > Forget manually loaded core */
-   romm_session_record_launch(core_path, fullpath);
+   if (fullpath && *fullpath)
+      romm_session_record_launch(core_path, fullpath);
    path_set(RARCH_PATH_CORE, core_path);
    path_clear(RARCH_PATH_CORE_LAST);
 
@@ -2508,7 +2542,195 @@ end:
 
    content_information_ctx_free(&content_ctx);
 
+   (void)cb;
+   (void)user_data;
    return ret;
+}
+
+#if defined(__3DS__) && defined(HAVE_NETWORKING)
+void rommarch_deferred_launch_process(void)
+{
+   content_ctx_info_t content_info;
+   bool ret;
+
+   if (!g_rommarch_deferred_launch.active ||
+       !g_rommarch_deferred_launch.ready)
+      return;
+
+   /* Clear readiness before entering content teardown/fork logic. This call is
+    * made by the normal runloop, after HTTP task callbacks have returned. */
+   g_rommarch_deferred_launch.ready = false;
+   memset(&content_info, 0, sizeof(content_info));
+
+   if (g_rommarch_deferred_launch.kind == ROMMARCH_DEFERRED_LAUNCH_CURRENT_CORE)
+   {
+      /* Normal "Load Content" from an integrated static core (mGBA, etc.)
+       * can reach the current-core loader directly. Resume that exact path
+       * here after the per-ROM pull has completed. */
+      g_rommarch_deferred_launch_bypass = true;
+      romm_session_record_launch(path_get(RARCH_PATH_CORE),
+            g_rommarch_deferred_launch.fullpath);
+      ret = task_push_load_content_with_core(
+            g_rommarch_deferred_launch.fullpath,
+            &content_info, g_rommarch_deferred_launch.core_type, NULL, NULL);
+      g_rommarch_deferred_launch_bypass = false;
+   }
+   else if (g_rommarch_deferred_launch.kind == ROMMARCH_DEFERRED_LAUNCH_NEW_CORE)
+   {
+      /* Static 3DS core CIAs normally enter through the "new core" menu path
+       * even though the emulator is already linked into the executable. This
+       * is the path that ultimately command-execs the integrated CIA. Resume
+       * it only after the selected ROM's save has been checked/pulled. */
+      g_rommarch_deferred_launch_bypass = true;
+      romm_session_record_launch(g_rommarch_deferred_launch.core_path,
+            g_rommarch_deferred_launch.fullpath);
+      ret = task_push_load_content_with_new_core_from_menu(
+            g_rommarch_deferred_launch.core_path,
+            g_rommarch_deferred_launch.fullpath,
+            &content_info, g_rommarch_deferred_launch.core_type, NULL, NULL);
+      g_rommarch_deferred_launch_bypass = false;
+   }
+   else
+      ret = task_push_load_content_from_playlist_from_menu_internal(
+            g_rommarch_deferred_launch.core_path,
+            g_rommarch_deferred_launch.fullpath,
+            *g_rommarch_deferred_launch.label ? g_rommarch_deferred_launch.label : NULL,
+            &content_info, NULL, NULL);
+
+   memset(&g_rommarch_deferred_launch, 0, sizeof(g_rommarch_deferred_launch));
+
+   if (!ret)
+      retroarch_menu_running();
+}
+
+static void rommarch_deferred_launch_after_pull(bool success, void *userdata)
+{
+   (void)success;
+   (void)userdata;
+
+   /* A network failure must not strand the user in the menu. The sync engine
+    * has already reported the error; launch using the best local save we have.
+    * The runloop performs the actual launch after this callback returns. */
+   if (g_rommarch_deferred_launch.active)
+      g_rommarch_deferred_launch.ready = true;
+}
+
+static void rommarch_deferred_launch_begin_pull(void)
+{
+   if (!g_rommarch_deferred_launch.active)
+      return;
+
+   if (rommarch_auto_sync_start(g_rommarch_deferred_launch.fullpath,
+            ROMMARCH_AUTO_SYNC_PULL, rommarch_deferred_launch_after_pull, NULL))
+   {
+      if (g_rommarch_deferred_launch.kind == ROMMARCH_DEFERRED_LAUNCH_CURRENT_CORE &&
+          !g_rommarch_deferred_launch.progress_shown)
+      {
+         rommarch_auto_sync_show_progress();
+         g_rommarch_deferred_launch.progress_shown = true;
+      }
+      return;
+   }
+
+   g_rommarch_deferred_launch.ready = true;
+}
+
+static void rommarch_deferred_launch_after_push(bool success, void *userdata)
+{
+   (void)success;
+   (void)userdata;
+
+   /* The old content is no longer the active session once we proceed to the
+    * replacement title. Do not allow its marker to masquerade as a pending
+    * save in the newly launched process. */
+   romm_session_set_pending(false);
+   rommarch_deferred_launch_begin_pull();
+}
+
+bool rommarch_deferred_launch_pending(void)
+{
+   return g_rommarch_deferred_launch.active;
+}
+#else
+void rommarch_deferred_launch_process(void)
+{
+}
+
+bool rommarch_deferred_launch_pending(void)
+{
+   return false;
+}
+#endif
+
+bool task_push_load_content_from_playlist_from_menu(
+      const char *core_path,
+      const char *fullpath,
+      const char *label,
+      content_ctx_info_t *content_info,
+      retro_task_callback_t cb,
+      void *user_data)
+{
+#if defined(__3DS__) && defined(HAVE_NETWORKING)
+   if (romm_config_get_automatic_sync() && fullpath && *fullpath)
+   {
+      runloop_state_t *runloop_st = runloop_state_get_ptr();
+      romm_session_t session;
+      const char *current_content = path_get(RARCH_PATH_CONTENT);
+
+      if (rommarch_save_sync_busy())
+      {
+         const char *busy = "RomMArch: Finish the current save sync before launching content";
+         runloop_msg_queue_push(busy, strlen(busy), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return true;
+      }
+
+      if (g_rommarch_deferred_launch.active)
+         return false;
+
+      memset(&g_rommarch_deferred_launch, 0, sizeof(g_rommarch_deferred_launch));
+      g_rommarch_deferred_launch.active = true;
+      g_rommarch_deferred_launch.kind = ROMMARCH_DEFERRED_LAUNCH_PLAYLIST;
+      g_rommarch_deferred_launch.core_type = CORE_TYPE_PLAIN;
+      strlcpy(g_rommarch_deferred_launch.core_path, core_path,
+            sizeof(g_rommarch_deferred_launch.core_path));
+      strlcpy(g_rommarch_deferred_launch.fullpath, fullpath,
+            sizeof(g_rommarch_deferred_launch.fullpath));
+      if (label)
+         strlcpy(g_rommarch_deferred_launch.label, label,
+               sizeof(g_rommarch_deferred_launch.label));
+
+      /* If gameplay is already active, first flush SRAM and push only that
+       * title's save. This keeps a content switch ordered as:
+       * old save -> RomM, new save <- RomM, then launch. */
+      if (romm_session_load(&session) && session.pending)
+      {
+         /* A pending marker may also survive a prior failed quit/upload. In
+          * that case the dummy frontend can retry it before the next launch,
+          * using the already-flushed save on disk. */
+         if (runloop_st->current_core_type != CORE_TYPE_DUMMY &&
+             current_content && *current_content)
+         {
+#ifdef HAVE_THREADS
+            if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+               autosave_deinit();
+#endif
+            command_event(CMD_EVENT_SAVE_FILES, NULL);
+            runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+         }
+         if (rommarch_auto_sync_start(session.content,
+                  ROMMARCH_AUTO_SYNC_PUSH,
+                  rommarch_deferred_launch_after_push, NULL))
+            return true;
+      }
+
+      rommarch_deferred_launch_begin_pull();
+      return true;
+   }
+#endif
+
+   return task_push_load_content_from_playlist_from_menu_internal(
+         core_path, fullpath, label, content_info, cb, user_data);
 }
 #endif
 
@@ -2924,6 +3146,68 @@ bool task_push_load_content_with_new_core_from_menu(
       retro_task_callback_t cb,
       void *user_data)
 {
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+   /* Static 3DS core CIAs normally reach this function from Load Content.
+    * Intercept here, before RetroArch decides whether it recognizes the
+    * linked core as "already loaded", so automatic sync cannot be bypassed by
+    * the static-core command-exec path. */
+   if (!g_rommarch_deferred_launch_bypass &&
+       romm_config_get_automatic_sync() && fullpath && *fullpath)
+   {
+      runloop_state_t *auto_runloop_st = runloop_state_get_ptr();
+      romm_session_t session;
+      const char *current_content = path_get(RARCH_PATH_CONTENT);
+
+      if (rommarch_save_sync_busy())
+      {
+         const char *busy = "RomMArch: Finish the current save sync before launching content";
+         runloop_msg_queue_push(busy, strlen(busy), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return true;
+      }
+
+      if (g_rommarch_deferred_launch.active)
+         return false;
+
+      memset(&g_rommarch_deferred_launch, 0, sizeof(g_rommarch_deferred_launch));
+      g_rommarch_deferred_launch.active = true;
+      g_rommarch_deferred_launch.kind = ROMMARCH_DEFERRED_LAUNCH_NEW_CORE;
+      g_rommarch_deferred_launch.core_type = type;
+      if (core_path)
+         strlcpy(g_rommarch_deferred_launch.core_path, core_path,
+               sizeof(g_rommarch_deferred_launch.core_path));
+      strlcpy(g_rommarch_deferred_launch.fullpath, fullpath,
+            sizeof(g_rommarch_deferred_launch.fullpath));
+
+      {
+         const char *msg = "RomMArch: Checking save before launch";
+         runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+      }
+
+      if (romm_session_load(&session) && session.pending)
+      {
+         if (auto_runloop_st->current_core_type != CORE_TYPE_DUMMY &&
+             current_content && *current_content)
+         {
+#ifdef HAVE_THREADS
+            if (auto_runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+               autosave_deinit();
+#endif
+            command_event(CMD_EVENT_SAVE_FILES, NULL);
+            auto_runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+         }
+         if (rommarch_auto_sync_start(session.content,
+                  ROMMARCH_AUTO_SYNC_PUSH,
+                  rommarch_deferred_launch_after_push, NULL))
+            return true;
+      }
+
+      rommarch_deferred_launch_begin_pull();
+      return true;
+   }
+#endif
+
    content_information_ctx_t content_ctx;
    content_state_t                 *p_content = content_state_get_ptr();
    bool ret                                   = true;
@@ -3136,6 +3420,72 @@ bool task_push_load_content_with_core(
       retro_task_callback_t cb,
       void *user_data)
 {
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+   /* Integrated 3DS core CIAs normally launch ROMs through this function
+    * (Load Content -> already-running core), not through the playlist/static
+    * core launcher. Defer this path too so the selected ROM's save is pulled
+    * before content_load() gives control to the emulator. */
+   if (!g_rommarch_deferred_launch_bypass &&
+       romm_config_get_automatic_sync() && fullpath && *fullpath)
+   {
+      runloop_state_t *runloop_st = runloop_state_get_ptr();
+      romm_session_t session;
+      const char *current_content = path_get(RARCH_PATH_CONTENT);
+
+      if (rommarch_save_sync_busy())
+      {
+         const char *busy = "RomMArch: Finish the current save sync before launching content";
+         runloop_msg_queue_push(busy, strlen(busy), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return true;
+      }
+
+      if (g_rommarch_deferred_launch.active)
+         return false;
+
+      memset(&g_rommarch_deferred_launch, 0, sizeof(g_rommarch_deferred_launch));
+      g_rommarch_deferred_launch.active = true;
+      g_rommarch_deferred_launch.kind = ROMMARCH_DEFERRED_LAUNCH_CURRENT_CORE;
+      g_rommarch_deferred_launch.core_type = type;
+      strlcpy(g_rommarch_deferred_launch.fullpath, fullpath,
+            sizeof(g_rommarch_deferred_launch.fullpath));
+
+      /* Match the playlist path's ordering when replacing live content:
+       * flush/push the old title first, then pull the new title, then load. */
+      if (romm_session_load(&session) && session.pending)
+      {
+         if (runloop_st->current_core_type != CORE_TYPE_DUMMY &&
+             current_content && *current_content)
+         {
+#ifdef HAVE_THREADS
+            if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+               autosave_deinit();
+#endif
+            command_event(CMD_EVENT_SAVE_FILES, NULL);
+            runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+         }
+         if (rommarch_auto_sync_start(session.content,
+                  ROMMARCH_AUTO_SYNC_PUSH,
+                  rommarch_deferred_launch_after_push, NULL))
+         {
+            /* A Reset-style same-core reload can spend several seconds in the
+             * automatic PUSH/PULL chain before content is reloaded. Keep one
+             * visible progress task alive across that lifecycle so the menu
+             * never appears frozen while network work is in progress. */
+            if (!g_rommarch_deferred_launch.progress_shown)
+            {
+               rommarch_auto_sync_show_progress();
+               g_rommarch_deferred_launch.progress_shown = true;
+            }
+            return true;
+         }
+      }
+
+      rommarch_deferred_launch_begin_pull();
+      return true;
+   }
+#endif
+
    path_set(RARCH_PATH_CONTENT, fullpath);
    return task_load_content_internal_wrap(content_info, type, false);
 }

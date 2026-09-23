@@ -117,6 +117,9 @@ bool android_get_vfs_authorized_locations(
 
 #include "runtime_file.h"
 #include "runloop.h"
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+#include "romm/romm_auto_sync.h"
+#endif
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
@@ -6608,6 +6611,15 @@ static enum runloop_state_enum runloop_check_state(
       action                    = (enum menu_action)menu_event(
             settings,
             &current_bits, &trigger_input, display_kb);
+#if defined(__3DS__) && defined(HAVE_NETWORKING)
+      /* Automatic save sync may be holding either a deferred Close Content
+       * unload or a deferred content reload/launch. Keep drawing the menu and
+       * progress widget, but do not execute navigation or command entries
+       * while that lifecycle operation owns input. */
+      if ((rommarch_auto_exit_pending() || rommarch_deferred_launch_pending()) &&
+          rommarch_auto_sync_blocks_menu())
+         action = MENU_ACTION_NOOP;
+#endif
 #ifdef HAVE_NETWORKING
       if (!netplay_allow_pause)
          focused = true;
@@ -7954,6 +7966,14 @@ int runloop_iterate(void)
     * because content_load() reinitializes the task queue - fatal
     * from inside the queue's own dispatch. */
    task_content_deferred_load_check();
+#endif
+
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+   /* RomMArch uses the same continuation rule for automatic save sync:
+    * HTTP task callbacks only mark lifecycle work ready. Core launch/unload
+    * resumes here on the next normal runloop iteration. */
+   rommarch_deferred_exit_process();
+   rommarch_deferred_launch_process();
 #endif
 
    /* Tick deferred shader compilation (one pass per frame) */

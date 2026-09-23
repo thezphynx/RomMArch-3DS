@@ -57,6 +57,28 @@ void romm_session_record_launch(const char *core_path, const char *content_path)
    fclose(fp);
 }
 
+bool romm_session_set_pending(bool pending)
+{
+   romm_session_t session;
+   FILE *fp;
+
+   if (!romm_session_load(&session))
+      return false;
+
+   fp = fopen(ROMM_SESSION_PATH, "w");
+   if (!fp)
+      return false;
+
+   fprintf(fp, "core=%s\n", session.core);
+   fprintf(fp, "content=%s\n", session.content);
+   fprintf(fp, "core_name=%s\n", session.core_name);
+   fprintf(fp, "save=%s\n", session.save);
+   fprintf(fp, "pending=%d\n", pending ? 1 : 0);
+
+   fclose(fp);
+   return true;
+}
+
 bool romm_session_has_pending(void)
 {
    FILE *fp = fopen(ROMM_SESSION_PATH, "r");

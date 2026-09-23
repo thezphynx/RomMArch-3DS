@@ -294,7 +294,8 @@ void *intfstream_init(intfstream_info_t *info)
       case INTFSTREAM_FILE:
          break;
       case INTFSTREAM_MEMORY:
-         intf->memory.fp = memstream_open(info->memory.buf.data, info->memory.buf.size, info->memory.writable);
+         intf->memory.fp = memstream_open_ex(info->memory.buf.data,
+               info->memory.buf.size, info->memory.writable);
          break;
       case INTFSTREAM_CHD:
 #ifdef HAVE_CHD

@@ -197,6 +197,9 @@
 #include "verbosity.h"
 #ifdef __3DS__
 #include "romm/romm_session.h"
+#if defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+#include "romm/romm_auto_sync.h"
+#endif
 #endif
 
 #include "gfx/video_driver.h"
@@ -3335,6 +3338,20 @@ static void command_event_finish_content_deinit(void)
 
 }
 
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+typedef enum rommarch_auto_exit_action
+{
+   ROMMARCH_AUTO_EXIT_NONE = 0,
+   ROMMARCH_AUTO_EXIT_UNLOAD,
+   ROMMARCH_AUTO_EXIT_QUIT
+} rommarch_auto_exit_action_t;
+
+static rommarch_auto_exit_action_t g_rommarch_auto_exit_action;
+static bool g_rommarch_auto_exit_load_dummy = true;
+static bool g_rommarch_auto_exit_ready;
+static void rommarch_auto_exit_complete(bool success, void *userdata);
+#endif
+
 bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
@@ -3851,6 +3868,30 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_RESET:
          {
+#if defined(__3DS__) && defined(HAVE_MENU)
+            /* Some 3DS static cores can hang indefinitely inside retro_reset().
+             * Reload the current content inside the already-running statically
+             * linked core instead. Do not use the "new core" menu path here:
+             * on 3DS that path may command-exec/install the CIA referenced by
+             * RARCH_PATH_CORE. The current-core path performs MAIN_DEINIT /
+             * MAIN_INIT in this process and is also covered by RomMArch's
+             * replacement-content save-sync lifecycle when enabled. */
+            const char *content_path = path_get(RARCH_PATH_CONTENT);
+
+            if (content_path && *content_path)
+            {
+               content_ctx_info_t content_info;
+
+               content_info.argc        = 0;
+               content_info.argv        = NULL;
+               content_info.args        = NULL;
+               content_info.environ_get = NULL;
+
+               return task_push_load_content_with_core(
+                     content_path, &content_info,
+                     CORE_TYPE_PLAIN, NULL, NULL);
+            }
+#endif
             const char *_msg = msg_hash_to_str(MSG_RESET);
             RARCH_LOG("[Core] %s.\n", _msg);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 120, true, NULL,
@@ -4040,6 +4081,43 @@ bool command_event(enum event_command cmd, void *data)
          {
             bool load_dummy_core            = data ? *(bool*)data : true;
             content_ctx_info_t content_info = {0};
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+            if (g_rommarch_auto_exit_action == ROMMARCH_AUTO_EXIT_NONE &&
+                romm_config_get_automatic_sync() &&
+                runloop_st->current_core_type != CORE_TYPE_DUMMY)
+            {
+               romm_session_t session;
+               if (rommarch_save_sync_busy())
+               {
+                  const char *busy = "RomMArch: Finish the current save sync before closing content";
+                  runloop_msg_queue_push(busy, strlen(busy), 1, 180, true, NULL,
+                        MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+                  return true;
+               }
+               if (romm_session_load(&session) && session.pending)
+               {
+                  /* Freeze the content at the save we are about to upload.
+                   * The second UNLOAD_CORE invocation, from the completion
+                   * callback, performs the normal teardown. */
+#ifdef HAVE_THREADS
+                  if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+                     autosave_deinit();
+#endif
+                  command_event(CMD_EVENT_SAVE_FILES, NULL);
+                  runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+                  g_rommarch_auto_exit_action = ROMMARCH_AUTO_EXIT_UNLOAD;
+                  g_rommarch_auto_exit_load_dummy = load_dummy_core;
+                  if (rommarch_auto_sync_start(session.content,
+                           ROMMARCH_AUTO_SYNC_PUSH,
+                           rommarch_auto_exit_complete, NULL))
+                  {
+                     rommarch_auto_sync_show_progress();
+                     return true;
+                  }
+                  g_rommarch_auto_exit_action = ROMMARCH_AUTO_EXIT_NONE;
+               }
+            }
+#endif
             video_driver_state_t *video_st  = video_state_get_ptr();
             rarch_system_info_t *sys_info   = &runloop_st->system;
             uint8_t flags                   = content_get_flags();
@@ -4189,6 +4267,36 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          break;
       case CMD_EVENT_QUIT:
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+         if (g_rommarch_auto_exit_action == ROMMARCH_AUTO_EXIT_NONE &&
+             romm_config_get_automatic_sync() &&
+             runloop_st->current_core_type != CORE_TYPE_DUMMY)
+         {
+            romm_session_t session;
+            if (rommarch_save_sync_busy())
+            {
+               const char *busy = "RomMArch: Finish the current save sync before quitting";
+               runloop_msg_queue_push(busy, strlen(busy), 1, 180, true, NULL,
+                     MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+               return true;
+            }
+            if (romm_session_load(&session) && session.pending)
+            {
+#ifdef HAVE_THREADS
+               if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+                  autosave_deinit();
+#endif
+               command_event(CMD_EVENT_SAVE_FILES, NULL);
+               runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+               g_rommarch_auto_exit_action = ROMMARCH_AUTO_EXIT_QUIT;
+               if (rommarch_auto_sync_start(session.content,
+                        ROMMARCH_AUTO_SYNC_PUSH,
+                        rommarch_auto_exit_complete, NULL))
+                  return true;
+               g_rommarch_auto_exit_action = ROMMARCH_AUTO_EXIT_NONE;
+            }
+         }
+#endif
          if (!retroarch_main_quit())
             return false;
          break;
@@ -6152,6 +6260,61 @@ bool command_event(enum event_command cmd, void *data)
    return true;
 }
 
+#if defined(__3DS__) && defined(HAVE_MENU) && defined(HAVE_NETWORKING)
+bool rommarch_auto_exit_pending(void)
+{
+   return g_rommarch_auto_exit_action == ROMMARCH_AUTO_EXIT_UNLOAD;
+}
+
+static void rommarch_auto_exit_complete(bool success, void *userdata)
+{
+   (void)userdata;
+
+   /* Keep a failed session pending so a later launch still has a chance to
+    * recover it. A completed/conflict-resolved pass is no longer pending. */
+   if (success)
+      romm_session_set_pending(false);
+
+   /* Never unload/quit from inside the HTTP task callback. The runloop will
+    * resume the lifecycle operation on its next iteration. */
+   g_rommarch_auto_exit_ready = true;
+}
+
+void rommarch_deferred_exit_process(void)
+{
+   rommarch_auto_exit_action_t action;
+   bool load_dummy;
+
+   if (g_rommarch_auto_exit_action == ROMMARCH_AUTO_EXIT_NONE ||
+       !g_rommarch_auto_exit_ready)
+      return;
+
+   action = g_rommarch_auto_exit_action;
+   load_dummy = g_rommarch_auto_exit_load_dummy;
+   g_rommarch_auto_exit_ready = false;
+
+   /* Keep the action non-NONE while re-entering command_event(). That is the
+    * one-shot guard preventing a failed upload from immediately starting the
+    * same automatic sync again. */
+   if (action == ROMMARCH_AUTO_EXIT_UNLOAD)
+      command_event(CMD_EVENT_UNLOAD_CORE, &load_dummy);
+   else if (action == ROMMARCH_AUTO_EXIT_QUIT)
+      command_event(CMD_EVENT_QUIT, NULL);
+
+   g_rommarch_auto_exit_action = ROMMARCH_AUTO_EXIT_NONE;
+   g_rommarch_auto_exit_load_dummy = true;
+}
+#else
+bool rommarch_auto_exit_pending(void)
+{
+   return false;
+}
+
+void rommarch_deferred_exit_process(void)
+{
+}
+#endif
+
 /* FRONTEND */
 
 void retroarch_override_setting_set(
@@ -6709,15 +6872,15 @@ int rarch_main(int argc, char *argv[], void *data)
    {
       romm_session_t romm_session;
 
-      if (romm_session_load(&romm_session) && romm_session.pending)
-      {
-         const char *romm_msg = romm_session_save_exists(&romm_session)
-            ? "RomMArch: Previous save detected"
-            : "RomMArch: No save found for previous session";
-
-         runloop_msg_queue_push(romm_msg, strlen(romm_msg), 1, 180, true, NULL,
-               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
-      }
+      /* A pending session is only meaningful to automatic lifecycle recovery.
+       * If automatic synchronization is disabled, consume any stale session
+       * silently instead of reporting it on every subsequent launch. */
+      if (romm_session_load(&romm_session) && romm_session.pending
+#ifdef HAVE_MENU
+          && !romm_config_get_automatic_sync()
+#endif
+         )
+         romm_session_set_pending(false);
    }
 #endif
 

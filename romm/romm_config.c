@@ -241,6 +241,22 @@ bool romm_config_set_http_proxy_port(unsigned port)
    return romm_config_set_value("http_proxy_port", value);
 }
 
+bool romm_config_get_automatic_sync(void)
+{
+   char value[32];
+   if (!romm_config_get_value("automatic_sync", value, sizeof(value)))
+      return false;
+   return string_is_equal(value, "1") ||
+          string_is_equal_noncase(value, "true") ||
+          string_is_equal_noncase(value, "yes") ||
+          string_is_equal_noncase(value, "on");
+}
+
+bool romm_config_set_automatic_sync(bool enabled)
+{
+   return romm_config_set_value("automatic_sync", enabled ? "1" : "0");
+}
+
 bool romm_config_get_device_id(char *device_id, size_t device_id_size)
 {
    if (!device_id || !device_id_size)
@@ -352,6 +368,118 @@ bool romm_config_save_ready(long platform_id)
    char path[768];
    return romm_config_get_save_enabled(platform_id) &&
           romm_config_get_save_path(platform_id, path, sizeof(path)) && *path;
+}
+
+bool romm_config_get_save_platform_stored_name(long platform_id, char *out, size_t out_size)
+{
+   char key[64];
+   if (platform_id <= 0 || !out || out_size == 0)
+      return false;
+   snprintf(key, sizeof(key), "save_%ld_name", platform_id);
+   return romm_config_get_value(key, out, out_size);
+}
+
+bool romm_config_set_save_platform_stored_name(long platform_id, const char *name)
+{
+   char key[64];
+   char current[128];
+   if (platform_id <= 0 || !name || !*name)
+      return false;
+   snprintf(key, sizeof(key), "save_%ld_name", platform_id);
+   if (romm_config_get_value(key, current, sizeof(current)) && string_is_equal(current, name))
+      return true;
+   return romm_config_set_value(key, name);
+}
+
+size_t romm_config_get_known_save_platforms(long *out, size_t max_entries)
+{
+   FILE *fp;
+   char line[1024];
+   size_t count = 0;
+
+   if (!out || !max_entries)
+      return 0;
+
+   fp = fopen(ROMM_CONFIG_PATH, "r");
+   if (!fp)
+      return 0;
+
+   while (fgets(line, sizeof(line), fp) && count < max_entries)
+   {
+      long platform_id = 0;
+      char field[32];
+      size_t i;
+      bool duplicate = false;
+
+      field[0] = '\0';
+      if (sscanf(line, "save_%ld_%31[^=]=", &platform_id, field) != 2 ||
+          platform_id <= 0)
+         continue;
+      if (!string_is_equal(field, "name") &&
+          !string_is_equal(field, "enabled") &&
+          !string_is_equal(field, "path"))
+         continue;
+
+      for (i = 0; i < count; i++)
+         if (out[i] == platform_id)
+         {
+            duplicate = true;
+            break;
+         }
+      if (!duplicate)
+         out[count++] = platform_id;
+   }
+
+   fclose(fp);
+   return count;
+}
+
+size_t romm_config_get_ready_save_platforms(long *out, size_t max_entries)
+{
+   FILE *fp;
+   char line[1024];
+   size_t count = 0;
+
+   if (!out || !max_entries)
+      return 0;
+
+   fp = fopen(ROMM_CONFIG_PATH, "r");
+   if (!fp)
+      return 0;
+
+   while (fgets(line, sizeof(line), fp) && count < max_entries)
+   {
+      long platform_id = 0;
+      char value[32];
+      size_t i;
+      bool duplicate = false;
+
+      value[0] = '\0';
+      if (sscanf(line, "save_%ld_enabled=%31[^\r\n]", &platform_id, value) != 2 ||
+          platform_id <= 0)
+         continue;
+
+      if (!(string_is_equal(value, "1") ||
+            string_is_equal_noncase(value, "true") ||
+            string_is_equal_noncase(value, "yes") ||
+            string_is_equal_noncase(value, "on")))
+         continue;
+
+      if (!romm_config_save_ready(platform_id))
+         continue;
+
+      for (i = 0; i < count; i++)
+         if (out[i] == platform_id)
+         {
+            duplicate = true;
+            break;
+         }
+      if (!duplicate)
+         out[count++] = platform_id;
+   }
+
+   fclose(fp);
+   return count;
 }
 
 void romm_config_set_save_platform_context(long platform_id, const char *name)

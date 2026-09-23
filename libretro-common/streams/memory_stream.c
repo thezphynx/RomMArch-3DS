@@ -26,6 +26,11 @@
 
 #include <streams/memory_stream.h>
 
+/* Historical memstream API compatibility state. */
+static uint8_t *g_buffer       = NULL;
+static uint64_t g_size         = 0;
+static uint64_t last_file_size = 0;
+
 struct memstream
 {
    uint64_t size;
@@ -36,7 +41,8 @@ struct memstream
 };
 
 
-memstream_t *memstream_open(uint8_t *buf, uint64_t size, unsigned writing)
+static memstream_t *memstream_open_internal(
+      uint8_t *buf, uint64_t size, unsigned writing)
 {
    memstream_t *stream;
 
@@ -54,11 +60,46 @@ memstream_t *memstream_open(uint8_t *buf, uint64_t size, unsigned writing)
    return stream;
 }
 
+void memstream_set_buffer(uint8_t *buffer, uint64_t size)
+{
+   g_buffer = buffer;
+   g_size   = size;
+}
+
+uint64_t memstream_get_last_size(void)
+{
+   return last_file_size;
+}
+
+memstream_t *memstream_open(unsigned writing)
+{
+   memstream_t *stream;
+
+   if (!g_buffer || !g_size)
+      return NULL;
+
+   stream = memstream_open_internal(g_buffer, g_size, writing);
+   if (!stream)
+      return NULL;
+
+   g_buffer = NULL;
+   g_size   = 0;
+
+   return stream;
+}
+
+memstream_t *memstream_open_ex(
+      uint8_t *buf, uint64_t size, unsigned writing)
+{
+   return memstream_open_internal(buf, size, writing);
+}
+
 void memstream_close(memstream_t *stream)
 {
    if (!stream)
       return;
 
+   last_file_size = stream->writing ? stream->max_ptr : stream->size;
    free(stream);
 }
 

@@ -1,4 +1,16 @@
 # Future
+- ROMMARCH/3DS: Add configurable HTTP CONNECT proxy support for proxy-backed networks and phone hotspot/proxy workflows; proxy state/address/port are stored in `sdmc:/retroarch/rommarch.cfg`
+- ROMMARCH/3DS: Improve proxy connection-pool/task handling so switching proxy state does not reuse stale direct/proxied HTTP connections
+- ROMMARCH/3DS: Document stock 3DS proxy setup and mobile use cases, including RetroAchievements access with compatible RomMArch-integrated emulator builds
+- ROMMARCH/3DS: Reorganize Save Synchronization with Configure Core Save Directories, developer-only Automatic Synchronization, and Initiate Manual Sync rows; expose offline/no-network state without hiding saved platform configuration
+- ROMMARCH/3DS: Improve manual save reconciliation using RomM server `updated_at`; normalize pulled saves to canonical `<Title>.srm`, upload to the canonical remote save, preserve timestamped server history, and retain conflict resolution
+- ROMMARCH/3DS: Add Automatic Synchronization frontend/lifecycle plumbing for developer testing only; current public emulator CIA package does not yet support this as an end-user feature and the toggle should remain off
+- ROMMARCH/3DS: Add visible synchronization progress and menu input ownership for deferred save-sync lifecycle work so long network operations do not appear frozen
+- ROMMARCH/3DS: Speed up repeated RetroAchievements menu opens by skipping eager 3DS badge texture allocation that RGUI does not display
+- ROMMARCH/3DS: Fix Quick Menu Reset indefinite hangs on static 3DS cores by reloading current content in the already-running core instead of calling the problematic direct reset path
+- ROMMARCH/3DS: Restore historical libretro-common memstream entry points required by older static cores while retaining the current frontend API under `memstream_open_ex`
+- ROMMARCH/3DS: Link the 3DS frontend against portlibs zlib for validated static-core compatibility
+- ROMMARCH/3DS: Correct centered/right-aligned 3DS font positioning
 - 3DS: Remove bottom screen fade out animation
 - AI/TRANSLATION: Fix for drawing translation overlay within viewport
 - ANDROID: Fix Enter key not working on keyboards

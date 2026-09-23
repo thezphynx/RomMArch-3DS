@@ -32,7 +32,15 @@ RETRO_BEGIN_DECLS
 
 typedef struct memstream memstream_t;
 
-memstream_t *memstream_open(uint8_t *data, uint64_t size, unsigned writing);
+/* Historical libretro-common ABI used by older static cores. */
+memstream_t *memstream_open(unsigned writing);
+
+void memstream_set_buffer(uint8_t *buffer, uint64_t size);
+
+uint64_t memstream_get_last_size(void);
+
+/* Current frontend ABI, kept under a separate name for compatibility. */
+memstream_t *memstream_open_ex(uint8_t *data, uint64_t size, unsigned writing);
 
 void memstream_close(memstream_t *stream);
 

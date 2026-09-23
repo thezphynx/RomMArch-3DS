@@ -159,7 +159,7 @@ MAKEROM_ARGS_COMMON = -rsf $(APP_RSF) -exefslogo -elf $(TARGET).elf -icon $(TARG
 	-major "$(APP_VERSION_MAJOR)" -minor "$(APP_VERSION_MINOR)" -micro "$(APP_VERSION_MICRO)"
 
 INCDIRS := -I$(CTRULIB)/include
-LIBDIRS := -L. -L$(CTRULIB)/lib
+LIBDIRS := -L. -L$(CTRULIB)/lib -L$(DEVKITPRO)/portlibs/3ds/lib
 
 ARCH     := -march=armv6k -mtune=mpcore -mfloat-abi=hard -marm -mfpu=vfp -mtp=soft
 
@@ -214,7 +214,7 @@ else
   LIB_CORE_FULL += libretro_ctr.a
 endif
 
-LIBS	:= $(WHOLE_START) $(LIB_CORE) $(WHOLE_END) -lm
+LIBS	:= $(WHOLE_START) $(LIB_CORE) $(WHOLE_END) -lm -lz
 
 ifeq ($(DEBUG), 1)
 	LIBS	+= -lctrud

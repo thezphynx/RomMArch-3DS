@@ -547,9 +547,9 @@ static void ctr_font_render_line(
       }
 
       if (text_align == TEXT_ALIGN_RIGHT)
-         x -= (int)(width_accum * scale);
+         x += width - (int)(width_accum * scale);
       else
-         x -= (int)(width_accum * scale) / 2;
+         x += width / 2 - (int)(width_accum * scale) / 2;
    }
 
    if ((ctr->vertex_cache.size - (ctr->vertex_cache.current - ctr->vertex_cache.buffer)) < msg_len)
